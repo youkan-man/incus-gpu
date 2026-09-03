@@ -1,0 +1,982 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+VERSION="0.1.0"
+PROG="${0##*/}"
+
+SYSFS_ROOT="${INCUS_GPU_SYSFS_ROOT:-/sys}"
+PROC_ROOT="${INCUS_GPU_PROC_ROOT:-/proc}"
+ETC_ROOT="${INCUS_GPU_ETC_ROOT:-/etc}"
+DEV_ROOT="${INCUS_GPU_DEV_ROOT:-/dev}"
+INCUS_BIN="${INCUS_GPU_INCUS_BIN:-incus}"
+LSPCI_BIN="${INCUS_GPU_LSPCI_BIN:-lspci}"
+PYTHON_BIN="${INCUS_GPU_PYTHON_BIN:-python3}"
+
+PROJECT="${INCUS_PROJECT:-}"
+DRY_RUN=0
+FORCE=0
+YES=0
+STOP_MODE="none" # none | stop | restart
+START_REQUESTED=0
+FORCE_STOP=0
+STOP_TIMEOUT=60
+KEEP_ON_START_FAILURE=0
+INCUS_LIST_JSON=""
+VM_TYPE=""
+VM_STATUS=""
+VM_LOCATION=""
+VM_ORIGINALLY_RUNNING=0
+VM_SHOULD_START=0
+
+if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
+    C_RED=$'\033[31m'
+    C_YELLOW=$'\033[33m'
+    C_GREEN=$'\033[32m'
+    C_BLUE=$'\033[34m'
+    C_BOLD=$'\033[1m'
+    C_RESET=$'\033[0m'
+else
+    C_RED=""
+    C_YELLOW=""
+    C_GREEN=""
+    C_BLUE=""
+    C_BOLD=""
+    C_RESET=""
+fi
+
+info() { printf '%s[INFO]%s %s\n' "$C_BLUE" "$C_RESET" "$*" >&2; }
+ok()   { printf '%s[ OK ]%s %s\n' "$C_GREEN" "$C_RESET" "$*" >&2; }
+warn() { printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die()  { printf '%s[FAIL]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+
+usage() {
+    cat <<EOF_USAGE
+${C_BOLD}incus-gpu ${VERSION}${C_RESET} - Ubuntu/Incus VM向けGPUパススルー管理ツール
+
+使い方:
+  ${PROG} list
+  ${PROG} doctor [--vm VM] [--gpu GPU]
+  ${PROG} attach VM GPU [オプション]
+  ${PROG} detach VM [GPU] [オプション]
+  ${PROG} status VM
+  sudo ${PROG} prepare-host [--yes]
+  sudo ${PROG} prepare-host --undo [--yes]
+
+短縮形:
+  ${PROG} VM GPU [オプション]        # attach と同じ
+
+GPU指定:
+  1                    list の番号（1始まり）
+  0000:01:00.0         完全なPCI BDF
+  01:00.0              短いPCI BDF
+  RTX、NVIDIA、Radeon  lspci表示名の一意な部分文字列
+  auto                 非boot VGAのGPUが1台だけなら自動選択
+
+attach/detachオプション:
+  --device NAME         Incusデバイス名（attach）または削除対象名（detach）
+  --project NAME        Incusプロジェクト
+  --stop                VMが稼働中なら停止し、停止したままにする
+  --restart             VMが稼働中なら停止し、処理後に再起動する
+  --start               処理後にVMを起動する
+  --timeout SEC         通常停止の待機秒数（既定: 60）
+  --force-stop          通常停止失敗時に強制停止する
+  --force               boot VGA、使用中GPU、重複割当等の保護を解除
+  --keep-on-failure     attach後のVM起動失敗時にGPU設定を残す
+  --dry-run             変更コマンドを表示するだけ
+
+例:
+  ${PROG} list
+  ${PROG} doctor --vm ai-vm --gpu 1
+  ${PROG} attach ai-vm 0000:41:00.0 --restart
+  ${PROG} detach ai-vm 0000:41:00.0 --restart
+EOF_USAGE
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "必要なコマンドがありません: $1"
+}
+
+print_command() {
+    local arg
+    printf '+ ' >&2
+    for arg in "$@"; do
+        printf '%q ' "$arg" >&2
+    done
+    printf '\n' >&2
+}
+
+incus_base_command() {
+    local -n _out=$1
+    _out=("$INCUS_BIN" --force-local)
+    if [[ -n "$PROJECT" ]]; then
+        _out+=(--project "$PROJECT")
+    fi
+}
+
+incus_read() {
+    local cmd
+    incus_base_command cmd
+    "${cmd[@]}" "$@"
+}
+
+incus_mutate() {
+    local cmd
+    incus_base_command cmd
+    cmd+=("$@")
+    if (( DRY_RUN )); then
+        print_command "${cmd[@]}"
+        return 0
+    fi
+    "${cmd[@]}"
+}
+
+host_mutate() {
+    if (( DRY_RUN )); then
+        print_command "$@"
+        return 0
+    fi
+    "$@"
+}
+
+normalize_bdf() {
+    local value="${1,,}"
+    if [[ "$value" =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]]; then
+        printf '%s\n' "$value"
+    elif [[ "$value" =~ ^[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]]; then
+        printf '0000:%s\n' "$value"
+    else
+        return 1
+    fi
+}
+
+pci_path() {
+    printf '%s/bus/pci/devices/%s\n' "$SYSFS_ROOT" "$1"
+}
+
+pci_class() {
+    local file
+    file="$(pci_path "$1")/class"
+    [[ -r "$file" ]] && tr 'A-F' 'a-f' < "$file" || printf 'unknown\n'
+}
+
+pci_id_value() {
+    local bdf=$1 field=$2 file value
+    file="$(pci_path "$bdf")/$field"
+    if [[ -r "$file" ]]; then
+        value=$(<"$file")
+        printf '%s\n' "${value#0x}"
+    else
+        printf '????\n'
+    fi
+}
+
+pci_driver() {
+    local link
+    link="$(pci_path "$1")/driver"
+    if [[ -L "$link" ]]; then
+        basename "$(readlink -f "$link")"
+    else
+        printf -- '-\n'
+    fi
+}
+
+pci_iommu_group() {
+    local link
+    link="$(pci_path "$1")/iommu_group"
+    if [[ -L "$link" ]]; then
+        basename "$(readlink -f "$link")"
+    else
+        printf -- '-\n'
+    fi
+}
+
+pci_boot_vga() {
+    local file
+    file="$(pci_path "$1")/boot_vga"
+    [[ -r "$file" ]] && cat "$file" || printf '0\n'
+}
+
+pci_description() {
+    local bdf=$1 out vendor product
+    if command -v "$LSPCI_BIN" >/dev/null 2>&1; then
+        out=$("$LSPCI_BIN" -s "$bdf" -nn 2>/dev/null | head -n 1 || true)
+        if [[ -n "$out" ]]; then
+            out="${out#* }"
+            printf '%s\n' "$out"
+            return 0
+        fi
+    fi
+
+    vendor=$(pci_id_value "$bdf" vendor)
+    product=$(pci_id_value "$bdf" device)
+    printf 'PCI display controller [%s:%s]\n' "$vendor" "$product"
+}
+
+gpu_bdfs() (
+    shopt -s nullglob
+    local path class
+    for path in "$SYSFS_ROOT"/bus/pci/devices/*; do
+        [[ -r "$path/class" ]] || continue
+        class=$(tr 'A-F' 'a-f' < "$path/class")
+        case "$class" in
+            0x03*) basename "$path" ;;
+        esac
+    done | LC_ALL=C sort
+)
+
+list_gpus() {
+    local -a gpus
+    local idx=0 bdf group driver boot desc
+    mapfile -t gpus < <(gpu_bdfs)
+
+    if ((${#gpus[@]} == 0)); then
+        warn "GPUクラスのPCIデバイスが見つかりません。"
+        return 1
+    fi
+
+    printf '%-4s %-12s %-7s %-13s %-6s %s\n' 'No.' 'PCI BDF' 'IOMMU' 'HOST DRIVER' 'BOOT' 'DEVICE'
+    for bdf in "${gpus[@]}"; do
+        ((idx += 1))
+        group=$(pci_iommu_group "$bdf")
+        driver=$(pci_driver "$bdf")
+        boot=$(pci_boot_vga "$bdf")
+        [[ "$boot" == "1" ]] && boot='yes' || boot='no'
+        desc=$(pci_description "$bdf")
+        printf '%-4s %-12s %-7s %-13s %-6s %s\n' "$idx" "${bdf#0000:}" "$group" "$driver" "$boot" "$desc"
+    done
+}
+
+resolve_gpu() {
+    local selector=$1 normalized selector_lc bdf hay
+    local -a gpus=() matches=() candidates=()
+    mapfile -t gpus < <(gpu_bdfs)
+    ((${#gpus[@]} > 0)) || die "GPUが見つかりません。"
+
+    if normalized=$(normalize_bdf "$selector" 2>/dev/null); then
+        [[ -d "$(pci_path "$normalized")" ]] || die "PCIデバイスが存在しません: $normalized"
+        [[ "$(pci_class "$normalized")" == 0x03* ]] || die "指定デバイスはGPUクラスではありません: $normalized"
+        printf '%s\n' "$normalized"
+        return 0
+    fi
+
+    if [[ "$selector" =~ ^#?([0-9]+)$ ]]; then
+        local number=$((10#${BASH_REMATCH[1]}))
+        (( number >= 1 && number <= ${#gpus[@]} )) || die "GPU番号が範囲外です: $selector"
+        printf '%s\n' "${gpus[number-1]}"
+        return 0
+    fi
+
+    if [[ "${selector,,}" == "auto" ]]; then
+        for bdf in "${gpus[@]}"; do
+            [[ "$(pci_boot_vga "$bdf")" == "1" ]] || candidates+=("$bdf")
+        done
+        if ((${#candidates[@]} == 1)); then
+            printf '%s\n' "${candidates[0]}"
+            return 0
+        fi
+        warn "autoで一意に選べません。"
+        list_gpus >&2 || true
+        die "PCI BDFまたはlist番号を指定してください。"
+    fi
+
+    selector_lc=${selector,,}
+    for bdf in "${gpus[@]}"; do
+        hay="${bdf} $(pci_description "$bdf") $(pci_id_value "$bdf" vendor):$(pci_id_value "$bdf" device)"
+        if [[ "${hay,,}" == *"$selector_lc"* ]]; then
+            matches+=("$bdf")
+        fi
+    done
+
+    if ((${#matches[@]} == 1)); then
+        printf '%s\n' "${matches[0]}"
+        return 0
+    fi
+
+    if ((${#matches[@]} > 1)); then
+        warn "GPU指定 '$selector' が複数台に一致しました: ${matches[*]}"
+        list_gpus >&2 || true
+        die "より具体的なPCI BDFを指定してください。"
+    fi
+
+    list_gpus >&2 || true
+    die "GPU指定を解決できません: $selector"
+}
+
+load_instances() {
+    require_cmd "$INCUS_BIN"
+    require_cmd "$PYTHON_BIN"
+    INCUS_LIST_JSON=$(incus_read list --format=json) || die "Incusインスタンス一覧を取得できません。"
+}
+
+instance_record() {
+    local vm=$1
+    "$PYTHON_BIN" -c '
+import json, sys
+name = sys.argv[1]
+data = json.load(sys.stdin)
+if isinstance(data, dict) and "metadata" in data:
+    data = data["metadata"]
+for inst in data:
+    if inst.get("name") == name:
+        print("\t".join([
+            str(inst.get("type", "")),
+            str(inst.get("status", "")),
+            str(inst.get("location", "")),
+        ]))
+        raise SystemExit(0)
+raise SystemExit(3)
+' "$vm" <<<"$INCUS_LIST_JSON"
+}
+
+load_vm() {
+    local vm=$1 record
+    record=$(instance_record "$vm") || die "Incusインスタンスが見つかりません: $vm"
+    IFS=$'\t' read -r VM_TYPE VM_STATUS VM_LOCATION <<<"$record"
+    [[ "$VM_TYPE" == "virtual-machine" ]] || die "対象はIncus VMではありません: $vm (type=$VM_TYPE)"
+}
+
+instance_gpu_devices() {
+    local vm=$1 mode=${2:-expanded}
+    "$PYTHON_BIN" -c '
+import json, sys
+name, mode = sys.argv[1], sys.argv[2]
+data = json.load(sys.stdin)
+if isinstance(data, dict) and "metadata" in data:
+    data = data["metadata"]
+for inst in data:
+    if inst.get("name") != name:
+        continue
+    direct = inst.get("devices") or {}
+    expanded = inst.get("expanded_devices") or direct
+    source = direct if mode == "direct" else expanded
+    for dev_name in sorted(source):
+        dev = source.get(dev_name) or {}
+        if dev.get("type") != "gpu":
+            continue
+        origin = "local" if dev_name in direct and (direct.get(dev_name) or {}).get("type") == "gpu" else "profile"
+        print("\t".join([
+            dev_name,
+            str(dev.get("pci", "")),
+            str(dev.get("gputype", "physical")),
+            origin,
+        ]))
+    raise SystemExit(0)
+raise SystemExit(3)
+' "$vm" "$mode" <<<"$INCUS_LIST_JSON"
+}
+
+device_name_exists() {
+    local vm=$1 device_name=$2
+    "$PYTHON_BIN" -c '
+import json, sys
+name, wanted = sys.argv[1], sys.argv[2]
+data = json.load(sys.stdin)
+if isinstance(data, dict) and "metadata" in data:
+    data = data["metadata"]
+for inst in data:
+    if inst.get("name") == name:
+        devices = inst.get("expanded_devices") or inst.get("devices") or {}
+        raise SystemExit(0 if wanted in devices else 1)
+raise SystemExit(2)
+' "$vm" "$device_name" <<<"$INCUS_LIST_JSON"
+}
+
+gpu_assignments() {
+    local wanted=$1
+    "$PYTHON_BIN" -c '
+import json, sys
+wanted = sys.argv[1].lower()
+def norm(v):
+    v = str(v or "").lower()
+    if len(v) == 7 and v.count(":") == 1:
+        return "0000:" + v
+    return v
+data = json.load(sys.stdin)
+if isinstance(data, dict) and "metadata" in data:
+    data = data["metadata"]
+for inst in data:
+    devices = inst.get("expanded_devices") or inst.get("devices") or {}
+    for dev_name, dev in devices.items():
+        if (dev or {}).get("type") == "gpu" and norm((dev or {}).get("pci")) == wanted:
+            print("\t".join([
+                str(inst.get("name", "")),
+                str(dev_name),
+                str(inst.get("status", "")),
+            ]))
+' "$wanted" <<<"$INCUS_LIST_JSON"
+}
+
+choose_device_name() {
+    local vm=$1 bdf=$2 requested=${3:-} base candidate suffix=1
+    if [[ -n "$requested" ]]; then
+        [[ "$requested" =~ ^[A-Za-z0-9_.-]+$ ]] || die "不正なIncusデバイス名です: $requested"
+        if device_name_exists "$vm" "$requested"; then
+            die "同名のIncusデバイスが既に存在します: $requested"
+        fi
+        printf '%s\n' "$requested"
+        return 0
+    fi
+
+    base="gpu-${bdf#0000:}"
+    base=${base//:/-}
+    base=${base//./-}
+    candidate=$base
+    while device_name_exists "$vm" "$candidate"; do
+        ((suffix += 1))
+        candidate="${base}-${suffix}"
+    done
+    printf '%s\n' "$candidate"
+}
+
+check_cluster_location() {
+    local vm=$1 fatal=${2:-1} server_json record clustered server_name
+    server_json=$(incus_read query /1.0 2>/dev/null || true)
+    [[ -n "$server_json" ]] || return 0
+    record=$("$PYTHON_BIN" -c '
+import json, sys
+data = json.load(sys.stdin)
+if isinstance(data, dict) and "metadata" in data:
+    data = data["metadata"]
+env = data.get("environment") or {}
+clustered = env.get("server_clustered", False)
+print(("true" if clustered else "false") + "\t" + str(env.get("server_name", "")))
+' <<<"$server_json" 2>/dev/null || true)
+    [[ -n "$record" ]] || return 0
+    IFS=$'\t' read -r clustered server_name <<<"$record"
+    if [[ "$clustered" == "true" && -n "$VM_LOCATION" && "$VM_LOCATION" != "none" && "$VM_LOCATION" != "$server_name" ]]; then
+        local message="VM '$vm' はクラスタメンバー '$VM_LOCATION' 上にあります。このツールをそのメンバー上で実行してください（現在: '$server_name'）。"
+        if (( fatal )); then
+            die "$message"
+        fi
+        warn "$message"
+        return 1
+    fi
+}
+
+is_bridge_class() {
+    [[ "$(pci_class "$1")" == 0x0604* ]]
+}
+
+preflight_gpu() {
+    local bdf=$1 path group group_path member member_bdf class boot driver desc
+    local -a related=() foreign=() busy_nodes=()
+    path=$(pci_path "$bdf")
+    [[ -d "$path" ]] || die "PCIデバイスが消失しました: $bdf"
+
+    desc=$(pci_description "$bdf")
+    group=$(pci_iommu_group "$bdf")
+    driver=$(pci_driver "$bdf")
+    boot=$(pci_boot_vga "$bdf")
+
+    info "GPU: $bdf / $desc"
+    info "Host driver: $driver / IOMMU group: $group"
+
+    if [[ "$group" == "-" ]]; then
+        die "IOMMUグループがありません。BIOS/UEFIでVT-dまたはAMD-Viを有効化し、必要なら 'sudo ${PROG} prepare-host' 実行後に再起動してください。"
+    fi
+
+    if [[ "$boot" == "1" ]]; then
+        warn "このGPUはboot VGAです。割り当てるとホストの画面が消えたり、ホストが操作不能になる可能性があります。"
+        (( FORCE )) || die "続行する場合だけ --force を付けてください。"
+    fi
+
+    shopt -s nullglob
+    local drm_entry node
+    for drm_entry in "$path"/drm/*; do
+        node="$DEV_ROOT/dri/$(basename "$drm_entry")"
+        [[ -e "$node" ]] || continue
+        if command -v fuser >/dev/null 2>&1 && fuser -s "$node" 2>/dev/null; then
+            busy_nodes+=("$node")
+        fi
+    done
+    shopt -u nullglob
+
+    if ((${#busy_nodes[@]} > 0)); then
+        warn "ホスト上のプロセスがGPUデバイスを使用しています: ${busy_nodes[*]}"
+        (( FORCE )) || die "表示サーバーやGPU処理を停止するか、確認の上 --force を付けてください。"
+    fi
+
+    group_path=$(readlink -f "$path/iommu_group")
+    if [[ -d "$group_path/devices" ]]; then
+        shopt -s nullglob
+        for member in "$group_path"/devices/*; do
+            member_bdf=$(basename "$member")
+            [[ "$member_bdf" == "$bdf" ]] && continue
+            if [[ "${member_bdf%.*}" == "${bdf%.*}" ]]; then
+                related+=("$member_bdf")
+            elif ! is_bridge_class "$member_bdf"; then
+                class=$(pci_class "$member_bdf")
+                foreign+=("$member_bdf(class=$class,driver=$(pci_driver "$member_bdf"))")
+            fi
+        done
+        shopt -u nullglob
+    fi
+
+    if ((${#related[@]} > 0)); then
+        info "GPU関連PCI機能（音声/USB等）: ${related[*]}"
+    fi
+
+    if ((${#foreign[@]} > 0)); then
+        warn "同じIOMMUグループにGPU基板外と思われるPCIエンドポイントがあります: ${foreign[*]}"
+        warn "この構成はVFIOグループ制約でVM起動に失敗する可能性が高いです。"
+        (( FORCE )) || die "IOMMU分離を見直すか、内容を確認して --force を付けてください。"
+    fi
+}
+
+check_other_assignments() {
+    local vm=$1 bdf=$2 other_vm dev status other_found=0
+    while IFS=$'\t' read -r other_vm dev status; do
+        [[ -n "$other_vm" ]] || continue
+        if [[ "$other_vm" == "$vm" ]]; then
+            printf '%s\t%s\t%s\n' "$other_vm" "$dev" "$status"
+            continue
+        fi
+        warn "GPU $bdf は別VMにも設定済みです: VM=$other_vm device=$dev status=$status"
+        other_found=1
+    done < <(gpu_assignments "$bdf")
+
+    if (( other_found && ! FORCE )); then
+        die "同一GPUの重複割当を許可する場合だけ --force を付けてください（同時起動はできません）。"
+    fi
+}
+
+stop_vm_for_change() {
+    local vm=$1 status_lc=${VM_STATUS,,}
+    VM_ORIGINALLY_RUNNING=0
+    VM_SHOULD_START=0
+
+    if [[ "$status_lc" == "stopped" ]]; then
+        (( START_REQUESTED )) && VM_SHOULD_START=1
+        return 0
+    fi
+
+    if [[ "$status_lc" == "running" ]]; then
+        VM_ORIGINALLY_RUNNING=1
+    fi
+
+    case "$STOP_MODE" in
+        stop)
+            ;;
+        restart)
+            VM_SHOULD_START=1
+            ;;
+        none)
+            die "VM '$vm' は停止していません (status=$VM_STATUS)。--stop または --restart を指定してください。"
+            ;;
+        *) die "内部エラー: 不正なSTOP_MODE=$STOP_MODE" ;;
+    esac
+
+    if (( DRY_RUN )); then
+        incus_mutate stop "$vm" --timeout "$STOP_TIMEOUT"
+        return 0
+    fi
+
+    info "VM '$vm' を停止します。"
+    if ! incus_read stop "$vm" --timeout "$STOP_TIMEOUT"; then
+        if (( FORCE_STOP )); then
+            warn "通常停止に失敗したため強制停止します。"
+            incus_read stop "$vm" --force
+        else
+            die "VMを停止できません。必要なら --force-stop を付けてください。"
+        fi
+    fi
+}
+
+start_vm_after_change() {
+    local vm=$1
+    (( VM_SHOULD_START || START_REQUESTED )) || return 0
+    info "VM '$vm' を起動します。"
+    incus_mutate start "$vm"
+}
+
+cmd_list() {
+    while (($#)); do
+        case "$1" in
+            -h|--help) usage; return 0 ;;
+            *) die "listの不明なオプションです: $1" ;;
+        esac
+    done
+    list_gpus
+}
+
+cmd_status() {
+    local vm=""
+    while (($#)); do
+        case "$1" in
+            --project) [[ $# -ge 2 ]] || die "--projectに値が必要です"; PROJECT=$2; shift 2 ;;
+            -h|--help) usage; return 0 ;;
+            -*) die "statusの不明なオプションです: $1" ;;
+            *) [[ -z "$vm" ]] || die "VM指定が多すぎます"; vm=$1; shift ;;
+        esac
+    done
+    [[ -n "$vm" ]] || die "VM名を指定してください。"
+
+    load_instances
+    load_vm "$vm"
+    check_cluster_location "$vm"
+
+    printf 'VM: %s\nType: %s\nStatus: %s\nLocation: %s\n' "$vm" "$VM_TYPE" "$VM_STATUS" "${VM_LOCATION:--}"
+    printf 'GPU devices:\n'
+    local lines line name bdf type origin count=0
+    lines=$(instance_gpu_devices "$vm" expanded || true)
+    while IFS=$'\t' read -r name bdf type origin; do
+        [[ -n "$name" ]] || continue
+        ((count += 1))
+        printf '  - %-20s pci=%-12s gputype=%-10s origin=%s' "$name" "${bdf:-auto}" "$type" "$origin"
+        if [[ -n "$bdf" ]]; then
+            local normalized
+            normalized=$(normalize_bdf "$bdf" 2>/dev/null || printf '%s' "$bdf")
+            if [[ -d "$(pci_path "$normalized")" ]]; then
+                printf ' host-driver=%s iommu=%s' "$(pci_driver "$normalized")" "$(pci_iommu_group "$normalized")"
+            else
+                printf ' host-device=not-on-this-node'
+            fi
+        fi
+        printf '\n'
+    done <<<"$lines"
+    ((count > 0)) || printf '  (none)\n'
+}
+
+cmd_attach() {
+    local vm="" selector="" requested_device="" bdf device existing_line=""
+    local -a positional=()
+
+    while (($#)); do
+        case "$1" in
+            --vm) [[ $# -ge 2 ]] || die "--vmに値が必要です"; vm=$2; shift 2 ;;
+            --gpu) [[ $# -ge 2 ]] || die "--gpuに値が必要です"; selector=$2; shift 2 ;;
+            --device|--device-name) [[ $# -ge 2 ]] || die "$1に値が必要です"; requested_device=$2; shift 2 ;;
+            --project) [[ $# -ge 2 ]] || die "--projectに値が必要です"; PROJECT=$2; shift 2 ;;
+            --stop) STOP_MODE="stop"; shift ;;
+            --restart) STOP_MODE="restart"; shift ;;
+            --start) START_REQUESTED=1; shift ;;
+            --force-stop) FORCE_STOP=1; shift ;;
+            --force) FORCE=1; shift ;;
+            --timeout) [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || die "--timeoutには秒数が必要です"; STOP_TIMEOUT=$2; shift 2 ;;
+            --keep-on-failure) KEEP_ON_START_FAILURE=1; shift ;;
+            --dry-run) DRY_RUN=1; shift ;;
+            -h|--help) usage; return 0 ;;
+            -*) die "attachの不明なオプションです: $1" ;;
+            *) positional+=("$1"); shift ;;
+        esac
+    done
+
+    [[ -n "$vm" ]] || vm=${positional[0]:-}
+    [[ -n "$selector" ]] || selector=${positional[1]:-}
+    ((${#positional[@]} <= 2)) || die "attachの位置引数が多すぎます。"
+    [[ -n "$vm" && -n "$selector" ]] || die "attachにはVM名とGPU指定が必要です。"
+
+    bdf=$(resolve_gpu "$selector")
+
+    load_instances
+    load_vm "$vm"
+    check_cluster_location "$vm"
+
+    existing_line=$(check_other_assignments "$vm" "$bdf")
+    if [[ -n "$existing_line" ]]; then
+        local existing_vm existing_device existing_status
+        IFS=$'\t' read -r existing_vm existing_device existing_status <<<"$existing_line"
+        ok "GPU $bdf はVM '$vm' に既に設定済みです (device=$existing_device)。変更はありません。"
+        return 0
+    fi
+
+    preflight_gpu "$bdf"
+    device=$(choose_device_name "$vm" "$bdf" "$requested_device")
+    stop_vm_for_change "$vm"
+
+    info "Incusデバイス '$device' としてGPU $bdf をVM '$vm' に追加します。"
+    incus_mutate config device add "$vm" "$device" gpu gputype=physical "pci=$bdf"
+
+    if (( VM_SHOULD_START || START_REQUESTED )); then
+        if ! start_vm_after_change "$vm"; then
+            if (( ! DRY_RUN && ! KEEP_ON_START_FAILURE )); then
+                warn "GPU追加後のVM起動に失敗しました。追加したデバイスをロールバックします。"
+                incus_read config device remove "$vm" "$device" || warn "ロールバックにも失敗しました。手動確認してください。"
+                if (( VM_ORIGINALLY_RUNNING )); then
+                    warn "元の構成でVMを再起動します。"
+                    incus_read start "$vm" || warn "元の構成でもVMを起動できませんでした。"
+                fi
+            fi
+            die "VM起動に失敗しました。'${PROG} status $vm' と 'incus info --show-log $vm' を確認してください。"
+        fi
+    fi
+
+    ok "GPUを設定しました: VM=$vm device=$device pci=$bdf"
+}
+
+cmd_detach() {
+    local vm="" selector="" requested_device="" bdf="" lines line name pci type origin
+    local -a positional=() candidates=()
+
+    while (($#)); do
+        case "$1" in
+            --vm) [[ $# -ge 2 ]] || die "--vmに値が必要です"; vm=$2; shift 2 ;;
+            --gpu) [[ $# -ge 2 ]] || die "--gpuに値が必要です"; selector=$2; shift 2 ;;
+            --device|--device-name) [[ $# -ge 2 ]] || die "$1に値が必要です"; requested_device=$2; shift 2 ;;
+            --project) [[ $# -ge 2 ]] || die "--projectに値が必要です"; PROJECT=$2; shift 2 ;;
+            --stop) STOP_MODE="stop"; shift ;;
+            --restart) STOP_MODE="restart"; shift ;;
+            --start) START_REQUESTED=1; shift ;;
+            --force-stop) FORCE_STOP=1; shift ;;
+            --force) FORCE=1; shift ;;
+            --timeout) [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || die "--timeoutには秒数が必要です"; STOP_TIMEOUT=$2; shift 2 ;;
+            --dry-run) DRY_RUN=1; shift ;;
+            -h|--help) usage; return 0 ;;
+            -*) die "detachの不明なオプションです: $1" ;;
+            *) positional+=("$1"); shift ;;
+        esac
+    done
+
+    [[ -n "$vm" ]] || vm=${positional[0]:-}
+    [[ -n "$selector" ]] || selector=${positional[1]:-}
+    ((${#positional[@]} <= 2)) || die "detachの位置引数が多すぎます。"
+    [[ -n "$vm" ]] || die "detachにはVM名が必要です。"
+
+    load_instances
+    load_vm "$vm"
+    check_cluster_location "$vm"
+    lines=$(instance_gpu_devices "$vm" direct || true)
+
+    if [[ -n "$requested_device" ]]; then
+        while IFS=$'\t' read -r name pci type origin; do
+            [[ "$name" == "$requested_device" ]] && candidates+=("$name"$'\t'"$pci")
+        done <<<"$lines"
+    elif [[ -n "$selector" ]]; then
+        bdf=$(resolve_gpu "$selector")
+        while IFS=$'\t' read -r name pci type origin; do
+            local normalized=""
+            normalized=$(normalize_bdf "$pci" 2>/dev/null || true)
+            [[ "$normalized" == "$bdf" ]] && candidates+=("$name"$'\t'"$pci")
+        done <<<"$lines"
+    else
+        while IFS=$'\t' read -r name pci type origin; do
+            [[ -n "$name" ]] && candidates+=("$name"$'\t'"$pci")
+        done <<<"$lines"
+    fi
+
+    if ((${#candidates[@]} == 0)); then
+        die "削除対象のローカルGPUデバイスが見つかりません。プロファイル由来のデバイスはstatusで確認してください。"
+    elif ((${#candidates[@]} > 1)); then
+        warn "GPUデバイスが複数あります:"
+        printf '  %b\n' "${candidates[@]}" >&2
+        die "--device NAME またはGPU指定で対象を絞ってください。"
+    fi
+
+    IFS=$'\t' read -r requested_device bdf <<<"${candidates[0]}"
+    stop_vm_for_change "$vm"
+
+    info "VM '$vm' からIncusデバイス '$requested_device' (pci=$bdf) を削除します。"
+    incus_mutate config device remove "$vm" "$requested_device"
+    start_vm_after_change "$vm"
+    ok "GPU設定を削除しました: VM=$vm device=$requested_device"
+}
+
+confirm_or_die() {
+    local prompt=$1 reply
+    (( YES || DRY_RUN )) && return 0
+    [[ -r /dev/tty ]] || die "確認入力できません。内容を確認して --yes を付けてください。"
+    printf '%s [y/N]: ' "$prompt" >/dev/tty
+    IFS= read -r reply </dev/tty || true
+    [[ "$reply" =~ ^[Yy]([Ee][Ss])?$ ]] || die "中止しました。"
+}
+
+write_managed_file() {
+    local path=$1 content=$2
+    if (( DRY_RUN )); then
+        printf '+ write %q\n%s\n' "$path" "$content" >&2
+        return 0
+    fi
+    mkdir -p "$(dirname "$path")"
+    if [[ -e "$path" ]] && ! grep -q '^# Managed by incus-gpu$' "$path"; then
+        cp -a "$path" "${path}.bak.$(date +%Y%m%d%H%M%S)"
+        warn "既存ファイルをバックアップしました: ${path}.bak.*"
+    fi
+    printf '%s\n' "$content" > "$path"
+    chmod 0644 "$path"
+}
+
+cmd_prepare_host() {
+    local undo=0 cpu_vendor iommu_flag grub_file modules_file cmdline
+    while (($#)); do
+        case "$1" in
+            --yes|-y) YES=1; shift ;;
+            --undo) undo=1; shift ;;
+            --dry-run) DRY_RUN=1; shift ;;
+            -h|--help) usage; return 0 ;;
+            *) die "prepare-hostの不明なオプションです: $1" ;;
+        esac
+    done
+
+    if (( ! DRY_RUN && EUID != 0 )); then
+        die "prepare-hostはroot権限が必要です。sudoで実行してください。"
+    fi
+
+    grub_file="$ETC_ROOT/default/grub.d/99-incus-gpu-passthrough.cfg"
+    modules_file="$ETC_ROOT/modules-load.d/incus-gpu-vfio.conf"
+
+    if (( undo )); then
+        info "incus-gpuが管理するIOMMU/VFIO起動設定を削除します。"
+        confirm_or_die "削除してinitramfs/GRUBを更新しますか?"
+        if (( DRY_RUN )); then
+            print_command rm -f "$grub_file" "$modules_file"
+        else
+            if [[ -e "$grub_file" ]] && grep -q '^# Managed by incus-gpu$' "$grub_file"; then rm -f "$grub_file"; fi
+            if [[ -e "$modules_file" ]] && grep -q '^# Managed by incus-gpu$' "$modules_file"; then rm -f "$modules_file"; fi
+        fi
+        command -v update-initramfs >/dev/null 2>&1 && host_mutate update-initramfs -u
+        command -v update-grub >/dev/null 2>&1 && host_mutate update-grub
+        ok "管理設定を削除しました。反映には再起動が必要です。"
+        return 0
+    fi
+
+    cpu_vendor=$(awk -F: '/^[[:space:]]*vendor_id[[:space:]]*:/{gsub(/[[:space:]]/, "", $2); print $2; exit}' "$PROC_ROOT/cpuinfo" 2>/dev/null || true)
+    case "$cpu_vendor" in
+        GenuineIntel) iommu_flag="intel_iommu=on" ;;
+        AuthenticAMD) iommu_flag="amd_iommu=on" ;;
+        *) die "CPUベンダーを判定できません。現在はx86_64 Intel/AMDのGRUB構成のみ自動設定します (vendor='$cpu_vendor')。" ;;
+    esac
+
+    command -v update-grub >/dev/null 2>&1 || (( DRY_RUN )) || die "update-grubがありません。UbuntuのGRUB環境で実行してください。"
+    command -v update-initramfs >/dev/null 2>&1 || (( DRY_RUN )) || die "update-initramfsがありません。"
+
+    cmdline=$(cat "$PROC_ROOT/cmdline" 2>/dev/null || true)
+    info "設定するカーネル引数: $iommu_flag iommu=pt"
+    if [[ "$cmdline" == *"$iommu_flag"* ]]; then
+        info "$iommu_flag は現在のカーネルでも有効です。永続設定とVFIOモジュール設定を確認・更新します。"
+    fi
+    warn "この処理はGRUBとinitramfsを更新します。BIOS/UEFI側のVT-d/AMD-Viは別途有効化が必要です。"
+    confirm_or_die "IOMMU/VFIO起動設定を適用しますか?"
+
+    write_managed_file "$grub_file" "# Managed by incus-gpu
+# Enables host IOMMU. Incus performs per-device vfio-pci rebinding when a VM starts.
+GRUB_CMDLINE_LINUX_DEFAULT=\"\${GRUB_CMDLINE_LINUX_DEFAULT} $iommu_flag iommu=pt\""
+    write_managed_file "$modules_file" "# Managed by incus-gpu
+vfio
+vfio_pci
+vfio_iommu_type1"
+
+    host_mutate update-initramfs -u
+    host_mutate update-grub
+    if command -v modprobe >/dev/null 2>&1; then
+        host_mutate modprobe vfio-pci || warn "vfio-pciを即時ロードできませんでした。再起動後に確認してください。"
+    fi
+
+    ok "ホスト起動設定を更新しました。再起動後に '${PROG} doctor' を実行してください。"
+}
+
+cmd_doctor() {
+    local vm="" selector="" failures=0 version="" bdf="" group="" modules=""
+    while (($#)); do
+        case "$1" in
+            --vm) [[ $# -ge 2 ]] || die "--vmに値が必要です"; vm=$2; shift 2 ;;
+            --gpu) [[ $# -ge 2 ]] || die "--gpuに値が必要です"; selector=$2; shift 2 ;;
+            --project) [[ $# -ge 2 ]] || die "--projectに値が必要です"; PROJECT=$2; shift 2 ;;
+            -h|--help) usage; return 0 ;;
+            *) die "doctorの不明なオプションです: $1" ;;
+        esac
+    done
+
+    printf 'incus-gpu doctor %s\n\n' "$VERSION"
+
+    if command -v "$INCUS_BIN" >/dev/null 2>&1; then
+        if version=$(incus_read version 2>/dev/null); then
+            version=$(printf '%s\n' "$version" | head -n 2 | tr '\n' ' ')
+            printf '[OK] Incus CLI/server: %s\n' "${version:-応答あり}"
+        else
+            printf '[NG] Incus CLIはありますがローカルサーバーへ接続できません\n'
+            ((failures += 1))
+        fi
+    else
+        printf '[NG] Incus CLIがありません: %s\n' "$INCUS_BIN"
+        ((failures += 1))
+    fi
+
+    if command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+        printf '[OK] Python JSON parser: %s\n' "$PYTHON_BIN"
+    else
+        printf '[NG] Python 3がありません: %s\n' "$PYTHON_BIN"
+        ((failures += 1))
+    fi
+
+    if [[ -e "$DEV_ROOT/kvm" ]]; then
+        printf '[OK] KVM device: %s/kvm\n' "$DEV_ROOT"
+    else
+        printf '[NG] /dev/kvm相当がありません: %s/kvm\n' "$DEV_ROOT"
+        ((failures += 1))
+    fi
+
+    if [[ -d "$SYSFS_ROOT/kernel/iommu_groups" ]] && find "$SYSFS_ROOT/kernel/iommu_groups" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null | grep -q .; then
+        printf '[OK] Host IOMMU groups are present\n'
+    else
+        printf '[NG] Host IOMMU groups are absent\n'
+        ((failures += 1))
+    fi
+
+    modules=$(awk '{print $1}' "$PROC_ROOT/modules" 2>/dev/null | grep -E '^vfio(_pci|_iommu_type1)?$' | sort | tr '\n' ' ' || true)
+    if [[ "$modules" == *"vfio_pci"* || -d "$SYSFS_ROOT/module/vfio_pci" ]]; then
+        printf '[OK] VFIO modules: %s\n' "${modules:-vfio_pci}"
+    else
+        printf '[WARN] vfio_pciは現在未ロードです（VM起動時にロード可能なら問題ありません）\n'
+    fi
+
+    printf '\nGPU inventory:\n'
+    list_gpus || ((failures += 1))
+
+    if [[ -n "$selector" ]]; then
+        bdf=$(resolve_gpu "$selector")
+        group=$(pci_iommu_group "$bdf")
+        printf '\nSelected GPU: %s / %s\n' "$bdf" "$(pci_description "$bdf")"
+        printf '  driver=%s iommu_group=%s boot_vga=%s\n' "$(pci_driver "$bdf")" "$group" "$(pci_boot_vga "$bdf")"
+        [[ "$group" != "-" ]] || ((failures += 1))
+    fi
+
+    if [[ -n "$vm" && -x "$(command -v "$INCUS_BIN" 2>/dev/null || true)" ]]; then
+        load_instances
+        load_vm "$vm"
+        printf '\nVM: %s type=%s status=%s location=%s\n' "$vm" "$VM_TYPE" "$VM_STATUS" "${VM_LOCATION:--}"
+        if ! check_cluster_location "$vm" 0; then
+            ((failures += 1))
+        fi
+        local gpu_lines
+        gpu_lines=$(instance_gpu_devices "$vm" expanded || true)
+        if [[ -n "$gpu_lines" ]]; then
+            printf 'Configured GPU devices:\n%s\n' "$gpu_lines"
+        else
+            printf 'Configured GPU devices: none\n'
+        fi
+    fi
+
+    printf '\n'
+    if ((failures == 0)); then
+        ok "重大な前提不足は検出されませんでした。"
+    else
+        warn "$failures 件の重大な前提不足を検出しました。"
+        return 1
+    fi
+}
+
+main() {
+    local command=${1:-}
+    if [[ -z "$command" ]]; then
+        usage
+        return 1
+    fi
+    shift || true
+
+    case "$command" in
+        list|ls) cmd_list "$@" ;;
+        doctor|check) cmd_doctor "$@" ;;
+        attach|add) cmd_attach "$@" ;;
+        detach|remove|rm) cmd_detach "$@" ;;
+        status|show) cmd_status "$@" ;;
+        prepare-host|prepare) cmd_prepare_host "$@" ;;
+        version|--version|-V) printf '%s\n' "$VERSION" ;;
+        help|--help|-h) usage ;;
+        *)
+            # 短縮形: incus-gpu VM GPU [options]
+            cmd_attach "$command" "$@"
+            ;;
+    esac
+}
+
+main "$@"

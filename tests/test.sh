@@ -394,6 +394,24 @@ test_foreign_endpoint_is_blocked() {
         assert_contains "$out" '0000:05:00.0(class=0x020000,driver=-)'
 }
 
+test_bind_vfio_dry_run() {
+    local out
+    out=$($TOOL bind-vfio 0000:03:00.0 --force --dry-run 2>&1)
+    assert_contains "$out" 'vfio-pci' && \
+        assert_contains "$out" '0000:03:00.0/driver_override' && \
+        assert_contains "$out" '0000:03:00.1/driver_override' && \
+        [[ "$out" != *"0000:00:03.0/driver_override"* ]]
+}
+
+test_attach_prebind_dry_run() {
+    local out
+    out=$($TOOL attach vm-host-bridge 0000:03:00.0 \
+        --device dry-prebind --prebind-vfio --vfio-timeout 20 --dry-run 2>&1)
+    state_lacks_device vm-host-bridge dry-prebind && \
+        assert_contains "$out" '0000:03:00.0/driver_override' && \
+        assert_contains "$out" 'config device add'
+}
+
 test_prepare_dry_run() {
     local out
     out=$($TOOL prepare-host --dry-run --yes 2>&1)
@@ -444,6 +462,8 @@ run_test 'running VM requires --stop/--restart' test_running_requires_mode
 run_test 'running VM stops and restarts' test_running_restart
 run_test 'duplicate assignment is blocked' test_duplicate_blocked
 run_test 'boot VGA is blocked without --force' test_boot_vga_blocked
+run_test 'bind-vfio dry-run targets GPU functions only' test_bind_vfio_dry_run
+run_test 'attach supports VFIO prebind dry-run' test_attach_prebind_dry_run
 run_test 'unbound host bridge in GPU group is ignored' test_unbound_host_bridge_is_ignored
 run_test 'foreign endpoint in GPU group is still blocked' test_foreign_endpoint_is_blocked
 run_test 'prepare-host dry-run changes nothing' test_prepare_dry_run

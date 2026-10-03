@@ -19,6 +19,7 @@ incus config device add <VM> <DEVICE> gpu \
 - 稼働中VMを明示指定により停止し、設定後に再起動
 - VM起動失敗時、追加したGPUデバイスを自動ロールバック
 - VM起動失敗時、VFIOドライバー、IOMMUグループ、`driver_override`、カーネルログを自動採取
+- Incusの短いdriver probe待機を回避する、明示的な`vfio-pci`事前バインド
 - GPU設定の一覧表示と解除
 - Ubuntu/GRUB向けのIOMMU・VFIO起動設定を明示的なサブコマンドで生成
 - `--dry-run`対応
@@ -129,6 +130,24 @@ incus-gpu attach ai-vm 'RTX 4090' --restart
 incus-gpu attach ai-vm 1 --restart --dry-run
 ```
 
+Incusが`vfio-pci`への切り替え待機で失敗する環境では、root権限で事前バインドしてから起動できます。
+
+```bash
+sudo incus-gpu attach ai-vm 0000:41:00.0   --restart   --prebind-vfio   --vfio-timeout 15
+```
+
+事前バインドだけを単独で確認する場合:
+
+```bash
+sudo incus-gpu bind-vfio 0000:41:00.0 --timeout 15
+```
+
+ホストドライバーへ戻す場合:
+
+```bash
+sudo incus-gpu release-vfio 0000:41:00.0
+```
+
 ## 状態確認
 
 ```bash
@@ -181,6 +200,8 @@ incus-gpu doctor [--vm VM] [--gpu GPU] [--project NAME] [--kernel-log]
 incus-gpu attach VM GPU [options]
 incus-gpu detach VM [GPU] [options]
 incus-gpu status VM
+sudo incus-gpu bind-vfio GPU [--timeout SEC] [--force|--dry-run]
+sudo incus-gpu release-vfio GPU [--force|--dry-run]
 incus-gpu prepare-host [--yes|--dry-run|--undo]
 ```
 
@@ -202,6 +223,8 @@ incus-gpu ai-vm 1 --restart
 | `--timeout SEC` | 通常停止の待機秒数。既定60秒 |
 | `--force-stop` | 通常停止失敗時に強制停止 |
 | `--force` | boot VGA、使用中GPU、重複割当等の保護を解除 |
+| `--prebind-vfio` | Incus起動前にGPUと同一スロットの関連機能を`vfio-pci`へ事前バインド |
+| `--vfio-timeout SEC` | 事前バインド完了を待つ秒数。既定15秒 |
 | `--keep-on-failure` | GPU追加後のVM起動失敗時に設定を残す |
 | `--dry-run` | 変更コマンドを表示するだけ |
 
@@ -327,7 +350,19 @@ ls -ld /sys/bus/pci/drivers/vfio-pci
 sudo journalctl -k -b --no-pager | grep -Ei 'vfio|iommu|41:00'
 ```
 
-GPUのPCI BDFに合わせて`41:00`部分を置き換えてください。恒久的な`vfio-pci.ids=`設定や手動アンバインドはホストの表示を失う可能性があるため、本ツールは診断結果なしに自動適用しません。
+GPUのPCI BDFに合わせて`41:00`部分を置き換えてください。恒久的な`vfio-pci.ids=`設定や無条件の手動アンバインドはホストの表示を失う可能性があります。診断後に事前バインドを試す場合は次を使います。
+
+```bash
+sudo incus-gpu bind-vfio 0000:41:00.0 --timeout 15
+```
+
+`bind-vfio`と`attach --prebind-vfio`は、GPU本体と同じPCIスロットの音声等の機能だけを対象にします。未バインドのホストブリッジは対象にしません。途中で失敗した場合は、変更済み機能を元のドライバーと`driver_override`へ戻します。
+
+Incusの起動が成功した後は専用GPUとして`vfio-pci`に残ります。ホストへ戻す場合は、VMを停止してから次を実行します。
+
+```bash
+sudo incus-gpu release-vfio 0000:41:00.0
+```
 
 ## ゲスト側
 
@@ -378,8 +413,10 @@ make test
 - Incusクラスタの実行メンバー不一致防止
 - GPUと同一グループの未バインドホストブリッジを誤検出しないこと
 - GPUと同一グループの実エンドポイントは引き続き拒否すること
+- `bind-vfio --dry-run`がGPU本体と同一スロット機能だけを対象にすること
+- `attach --prebind-vfio --dry-run`がIncus設定前にVFIO操作を組み立てること
 
-合計15項目を検証します。
+合計17項目を検証します。
 
 ## 参考
 

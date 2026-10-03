@@ -22,7 +22,14 @@ jobs:
       - name: Apply changes
         run: |
           gzip -dc .github/scripts/apply-v0.1.3.py.gz > /tmp/apply-v0.1.3.py
-          grep -n -C 6 -- "--force) FORCE=1" /tmp/apply-v0.1.3.py || true
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('/tmp/apply-v0.1.3.py')
+          text = path.read_text()
+          for option in ('timeout', 'keep-on-failure', 'prebind-vfio', 'vfio-timeout'):
+              text = text.replace(f'\n                --{option})', f'\n            --{option})')
+          path.write_text(text)
+          PY
           python3 /tmp/apply-v0.1.3.py
 
       - name: Test

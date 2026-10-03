@@ -1,0 +1,37 @@
+name: Apply incus-gpu v0.1.3
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/apply-v0.1.3.yml"
+      - ".github/scripts/apply-v0.1.3.py.gz"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply changes
+        run: gzip -dc .github/scripts/apply-v0.1.3.py.gz | python3
+
+      - name: Test
+        run: |
+          git diff --check
+          bash -n incus-gpu install.sh uninstall.sh tests/test.sh
+          ./tests/test.sh
+
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md incus-gpu tests/test.sh
+          git commit -m "Add explicit VFIO prebind support"
+          git push

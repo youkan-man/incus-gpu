@@ -1,0 +1,41 @@
+name: Apply incus-gpu v0.1.2 patch
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/patches/incus-gpu-v0.1.2.patch.gz"
+      - ".github/workflows/apply-v0.1.2.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify and apply patch
+        run: |
+          echo "1f58c9efd3a7d7f2b5786b7b49e13eba561c41dc1d2538e542a36c5101fe3859  .github/patches/incus-gpu-v0.1.2.patch.gz" | sha256sum -c -
+          gzip -dc .github/patches/incus-gpu-v0.1.2.patch.gz > /tmp/incus-gpu-v0.1.2.patch
+          git apply --check /tmp/incus-gpu-v0.1.2.patch
+          git apply /tmp/incus-gpu-v0.1.2.patch
+
+      - name: Test
+        run: |
+          bash -n incus-gpu install.sh uninstall.sh tests/test.sh
+          ./tests/test.sh
+
+      - name: Commit fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md incus-gpu tests/test.sh
+          git commit -m "Fix IOMMU bridge detection and add VFIO diagnostics"
+          git push

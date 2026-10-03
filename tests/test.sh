@@ -398,6 +398,7 @@ test_bind_vfio_dry_run() {
     local out
     out=$($TOOL bind-vfio 0000:03:00.0 --force --dry-run 2>&1)
     assert_contains "$out" 'vfio-pci' && \
+        assert_contains "$out" 'drivers/vfio-pci/bind' && \
         assert_contains "$out" '0000:03:00.0/driver_override' && \
         assert_contains "$out" '0000:03:00.1/driver_override' && \
         [[ "$out" != *"0000:00:03.0/driver_override"* ]]
@@ -409,6 +410,7 @@ test_attach_prebind_dry_run() {
         --device dry-prebind --prebind-vfio --vfio-timeout 20 --dry-run 2>&1)
     state_lacks_device vm-host-bridge dry-prebind && \
         assert_contains "$out" '0000:03:00.0/driver_override' && \
+        assert_contains "$out" 'drivers/vfio-pci/bind' && \
         assert_contains "$out" 'config device add'
 }
 

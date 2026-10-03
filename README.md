@@ -20,6 +20,9 @@ incus config device add <VM> <DEVICE> gpu \
 - VM起動失敗時、追加したGPUデバイスを自動ロールバック
 - VM起動失敗時、VFIOドライバー、IOMMUグループ、`driver_override`、カーネルログを自動採取
 - Incusの短いdriver probe待機を回避する、明示的な`vfio-pci`事前バインド
+- `vfio-pci/bind`へ直接書き込み、`EINVAL`・`EBUSY`等のカーネル拒否理由を表示
+- probe失敗時にPCI BAR、電源状態、リンク状態、IOMMUグループ利用プロセスを採取
+- VM停止後の事前バインド・デバイス追加失敗時に、元々稼働中だったVMを自動復旧
 - GPU設定の一覧表示と解除
 - Ubuntu/GRUB向けのIOMMU・VFIO起動設定を明示的なサブコマンドで生成
 - `--dry-run`対応
@@ -133,7 +136,10 @@ incus-gpu attach ai-vm 1 --restart --dry-run
 Incusが`vfio-pci`への切り替え待機で失敗する環境では、root権限で事前バインドしてから起動できます。
 
 ```bash
-sudo incus-gpu attach ai-vm 0000:41:00.0   --restart   --prebind-vfio   --vfio-timeout 15
+sudo incus-gpu attach ai-vm 0000:41:00.0 \
+  --restart \
+  --prebind-vfio \
+  --vfio-timeout 15
 ```
 
 事前バインドだけを単独で確認する場合:
@@ -362,6 +368,37 @@ Incusの起動が成功した後は専用GPUとして`vfio-pci`に残ります�
 
 ```bash
 sudo incus-gpu release-vfio 0000:41:00.0
+```
+
+### 事前バインドが失敗する場合
+
+`bind-vfio`と`attach --prebind-vfio`は、`driver_override`設定後に
+`/sys/bus/pci/drivers/vfio-pci/bind`へ直接書き込みます。これにより、
+単に「時間内にバインドされなかった」と表示するのではなく、シェルが受け取った
+`Invalid argument`、`Device or resource busy`等のエラーも表示します。
+
+失敗時には次も自動採取します。
+
+- GPU本体と同一スロットの関連PCI機能
+- PCI vendor/device/subsystem/class/revision
+- BARリソース
+- PCIeリンク速度と幅
+- 電源状態、D3cold、reset method
+- `lspci -vvnnk`
+- `/dev/vfio/<group>`を使用するプロセス
+- 操作直後のカーネルログ
+
+一部の機能だけが既に`vfio-pci`へバインドされている場合は、残留状態として警告します。
+VMがGPUを使用していないことを確認したうえで完全に戻す場合:
+
+```bash
+sudo incus-gpu release-vfio 0000:41:00.0 --force
+```
+
+その後、もう一度単独診断します。
+
+```bash
+sudo incus-gpu bind-vfio 0000:41:00.0 --timeout 15
 ```
 
 ## ゲスト側

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="0.1.0"
+VERSION="0.1.2"
 PROG="${0##*/}"
 
 SYSFS_ROOT="${INCUS_GPU_SYSFS_ROOT:-/sys}"
@@ -55,7 +55,7 @@ ${C_BOLD}incus-gpu ${VERSION}${C_RESET} - Ubuntu/Incus VM向けGPUパススル�
 
 使い方:
   ${PROG} list
-  ${PROG} doctor [--vm VM] [--gpu GPU]
+  ${PROG} doctor [--vm VM] [--gpu GPU] [--kernel-log]
   ${PROG} attach VM GPU [オプション]
   ${PROG} detach VM [GPU] [オプション]
   ${PROG} status VM
@@ -84,9 +84,15 @@ attach/detachオプション:
   --keep-on-failure     attach後のVM起動失敗時にGPU設定を残す
   --dry-run             変更コマンドを表示するだけ
 
+doctorオプション:
+  --vm VM               対象VMを確認
+  --gpu GPU             対象GPUとIOMMU/VFIO状態を確認
+  --project NAME        Incusプロジェクト
+  --kernel-log          対象GPU、VFIO、IOMMUに関係するカーネルログも表示
+
 例:
   ${PROG} list
-  ${PROG} doctor --vm ai-vm --gpu 1
+  ${PROG} doctor --vm ai-vm --gpu 1 --kernel-log
   ${PROG} attach ai-vm 0000:41:00.0 --restart
   ${PROG} detach ai-vm 0000:41:00.0 --restart
 EOF_USAGE
@@ -454,7 +460,146 @@ print(("true" if clustered else "false") + "\t" + str(env.get("server_name", "")
 }
 
 is_bridge_class() {
-    [[ "$(pci_class "$1")" == 0x0604* ]]
+    local class driver
+    class=$(pci_class "$1")
+    driver=$(pci_driver "$1")
+
+    # PCI-to-PCI bridges were already ignored because they are topology
+    # devices rather than assignable endpoints. Some AMD platforms also
+    # place an unbound host bridge (for example class 0x060000) in the same
+    # IOMMU group as a GPU. An unbound bridge is not required to use vfio-pci.
+    [[ "$class" == 0x0604* ]] || [[ "$class" == 0x06* && "$driver" == "-" ]]
+}
+
+pci_driver_override() {
+    local file value
+    file="$(pci_path "$1")/driver_override"
+    if [[ ! -r "$file" ]]; then
+        printf -- '-\n'
+        return 0
+    fi
+
+    value=$(tr -d '\000\r\n' < "$file" 2>/dev/null || true)
+    case "$value" in
+        ''|'(null)') printf -- '-\n' ;;
+        *) printf '%s\n' "$value" ;;
+    esac
+}
+
+iommu_group_members() {
+    local -n _members=$1
+    local bdf=$2 path group_path member
+    _members=()
+    path=$(pci_path "$bdf")
+    group_path=$(readlink -f "$path/iommu_group" 2>/dev/null || true)
+    [[ -d "$group_path/devices" ]] || return 0
+
+    shopt -s nullglob
+    for member in "$group_path"/devices/*; do
+        _members+=("$(basename "$member")")
+    done
+    shopt -u nullglob
+}
+
+print_vfio_state() {
+    local bdf=$1 group member class driver override relation vfio_path
+    local -a members=()
+    group=$(pci_iommu_group "$bdf")
+    vfio_path="$SYSFS_ROOT/bus/pci/drivers/vfio-pci"
+    iommu_group_members members "$bdf"
+
+    printf '%s\n' '--- VFIO host state ---' >&2
+    if [[ -d "$vfio_path" ]]; then
+        printf 'vfio-pci driver: present (%s)\n' "$vfio_path" >&2
+    else
+        printf 'vfio-pci driver: MISSING (%s)\n' "$vfio_path" >&2
+    fi
+
+    printf 'IOMMU group: %s' "$group" >&2
+    if [[ "$group" != "-" ]]; then
+        if [[ -e "$DEV_ROOT/vfio/$group" ]]; then
+            printf ' / VFIO node: %s/vfio/%s\n' "$DEV_ROOT" "$group" >&2
+        else
+            printf ' / VFIO node: absent\n' >&2
+        fi
+    else
+        printf '\n' >&2
+    fi
+
+    for member in "${members[@]}"; do
+        class=$(pci_class "$member")
+        driver=$(pci_driver "$member")
+        override=$(pci_driver_override "$member")
+        if [[ "$member" == "$bdf" ]]; then
+            relation='target'
+        elif [[ "${member%.*}" == "${bdf%.*}" ]]; then
+            relation='same-device-function'
+        elif is_bridge_class "$member"; then
+            relation='unbound-bridge'
+        else
+            relation='other-endpoint'
+        fi
+        printf '  %s class=%s driver=%s override=%s role=%s\n' \
+            "$member" "$class" "$driver" "$override" "$relation" >&2
+    done
+}
+
+print_kernel_vfio_log() {
+    local bdf=$1 since_epoch=${2:-0} short_bdf pattern output=''
+
+    # Tests and alternate sysfs fixtures must never read the real host log.
+    if [[ "$SYSFS_ROOT" != "/sys" || "$PROC_ROOT" != "/proc" ]]; then
+        return 0
+    fi
+
+    short_bdf=${bdf#0000:}
+    pattern="${bdf}|${short_bdf}|vfio|iommu|amdgpu|driver_override"
+
+    if command -v journalctl >/dev/null 2>&1; then
+        if (( since_epoch > 0 )); then
+            output=$(journalctl -k -b --since "@${since_epoch}" --no-pager -o short-monotonic 2>/dev/null || true)
+        else
+            output=$(journalctl -k -b -n 250 --no-pager -o short-monotonic 2>/dev/null || true)
+        fi
+    fi
+
+    if [[ -z "$output" ]] && command -v dmesg >/dev/null 2>&1; then
+        output=$(dmesg --color=never 2>/dev/null | tail -n 250 || true)
+    fi
+
+    output=$(printf '%s\n' "$output" | grep -Ei "$pattern" | tail -n 80 || true)
+    if [[ -n "$output" ]]; then
+        printf '%s\n' '--- Relevant kernel log ---' >&2
+        printf '%s\n' "$output" >&2
+    else
+        warn "関連するカーネルログを取得できませんでした。必要なら sudo journalctl -k -b で確認してください。"
+    fi
+}
+
+print_project_log_command() {
+    local vm=$1
+    printf 'incus info --show-log %q' "$vm"
+    if [[ -n "$PROJECT" ]]; then
+        printf ' --project %q' "$PROJECT"
+    fi
+}
+
+diagnose_start_failure() {
+    local bdf=$1 since_epoch=${2:-0} current_driver group
+    warn "VM起動失敗時のGPU/VFIO状態を採取します。"
+    print_vfio_state "$bdf"
+    print_kernel_vfio_log "$bdf" "$since_epoch"
+
+    current_driver=$(pci_driver "$bdf")
+    group=$(pci_iommu_group "$bdf")
+    if [[ ! -d "$SYSFS_ROOT/bus/pci/drivers/vfio-pci" ]]; then
+        warn "vfio-pciドライバーが登録されていません。'sudo modprobe vfio-pci' とカーネル設定を確認してください。"
+    elif [[ "$current_driver" != "vfio-pci" ]]; then
+        warn "GPUはvfio-pciへバインドされていません (driver=$current_driver)。上のカーネルログにprobe失敗理由が出ます。"
+    fi
+    if [[ "$group" != "-" && ! -e "$DEV_ROOT/vfio/$group" ]]; then
+        warn "/dev/vfio/$group がありません。vfio-pciへのバインドが成立していない可能性があります。"
+    fi
 }
 
 preflight_gpu() {
@@ -688,7 +833,10 @@ cmd_attach() {
     incus_mutate config device add "$vm" "$device" gpu gputype=physical "pci=$bdf"
 
     if (( VM_SHOULD_START || START_REQUESTED )); then
+        local start_epoch
+        start_epoch=$(date +%s)
         if ! start_vm_after_change "$vm"; then
+            diagnose_start_failure "$bdf" "$start_epoch"
             if (( ! DRY_RUN && ! KEEP_ON_START_FAILURE )); then
                 warn "GPU追加後のVM起動に失敗しました。追加したデバイスをロールバックします。"
                 incus_read config device remove "$vm" "$device" || warn "ロールバックにも失敗しました。手動確認してください。"
@@ -697,7 +845,9 @@ cmd_attach() {
                     incus_read start "$vm" || warn "元の構成でもVMを起動できませんでした。"
                 fi
             fi
-            die "VM起動に失敗しました。'${PROG} status $vm' と 'incus info --show-log $vm' を確認してください。"
+            local info_cmd
+            info_cmd=$(print_project_log_command "$vm")
+            die "VM起動に失敗しました。'${PROG} doctor --vm $vm --gpu $bdf${PROJECT:+ --project $PROJECT} --kernel-log' と '$info_cmd' を確認してください。"
         fi
     fi
 
@@ -865,12 +1015,13 @@ vfio_iommu_type1"
 }
 
 cmd_doctor() {
-    local vm="" selector="" failures=0 version="" bdf="" group="" modules=""
+    local vm="" selector="" failures=0 version="" bdf="" group="" modules="" show_kernel_log=0
     while (($#)); do
         case "$1" in
             --vm) [[ $# -ge 2 ]] || die "--vmに値が必要です"; vm=$2; shift 2 ;;
             --gpu) [[ $# -ge 2 ]] || die "--gpuに値が必要です"; selector=$2; shift 2 ;;
             --project) [[ $# -ge 2 ]] || die "--projectに値が必要です"; PROJECT=$2; shift 2 ;;
+            --kernel-log) show_kernel_log=1; shift ;;
             -h|--help) usage; return 0 ;;
             *) die "doctorの不明なオプションです: $1" ;;
         esac
@@ -926,8 +1077,13 @@ cmd_doctor() {
         bdf=$(resolve_gpu "$selector")
         group=$(pci_iommu_group "$bdf")
         printf '\nSelected GPU: %s / %s\n' "$bdf" "$(pci_description "$bdf")"
-        printf '  driver=%s iommu_group=%s boot_vga=%s\n' "$(pci_driver "$bdf")" "$group" "$(pci_boot_vga "$bdf")"
+        printf '  driver=%s override=%s iommu_group=%s boot_vga=%s\n' \
+            "$(pci_driver "$bdf")" "$(pci_driver_override "$bdf")" "$group" "$(pci_boot_vga "$bdf")"
         [[ "$group" != "-" ]] || ((failures += 1))
+        print_vfio_state "$bdf"
+        if (( show_kernel_log )); then
+            print_kernel_vfio_log "$bdf" 0
+        fi
     fi
 
     if [[ -n "$vm" && -x "$(command -v "$INCUS_BIN" 2>/dev/null || true)" ]]; then

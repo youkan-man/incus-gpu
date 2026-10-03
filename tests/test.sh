@@ -15,7 +15,9 @@ STATE="$TMP/state.json"
 LOG="$TMP/incus.log"
 mkdir -p "$SYS/bus/pci/devices" "$SYS/bus/pci/drivers/nvidia" "$SYS/bus/pci/drivers/snd_hda_intel" \
          "$SYS/bus/pci/drivers/amdgpu" "$SYS/kernel/iommu_groups/7/devices" \
-         "$SYS/kernel/iommu_groups/8/devices" "$SYS/module/vfio_pci" \
+         "$SYS/kernel/iommu_groups/8/devices" "$SYS/kernel/iommu_groups/9/devices" \
+         "$SYS/kernel/iommu_groups/10/devices" "$SYS/module/vfio_pci" \
+         "$SYS/bus/pci/drivers/vfio-pci" "$DEV/vfio" \
          "$PROC" "$ETC" "$DEV" "$BIN"
 touch "$DEV/kvm"
 
@@ -27,7 +29,11 @@ make_pci() {
     printf '0x%s\n' "$vendor" > "$path/vendor"
     printf '0x%s\n' "$device" > "$path/device"
     printf '%s\n' "$boot" > "$path/boot_vga"
-    ln -s "$SYS/bus/pci/drivers/$driver" "$path/driver"
+    printf '(null)\n' > "$path/driver_override"
+    if [[ "$driver" != "-" ]]; then
+        mkdir -p "$SYS/bus/pci/drivers/$driver"
+        ln -s "$SYS/bus/pci/drivers/$driver" "$path/driver"
+    fi
     ln -s "$SYS/kernel/iommu_groups/$group" "$path/iommu_group"
     ln -s "$path" "$SYS/kernel/iommu_groups/$group/devices/$bdf"
 }
@@ -35,6 +41,13 @@ make_pci() {
 make_pci 0000:01:00.0 0x030000 10de 2684 nvidia 7 0
 make_pci 0000:01:00.1 0x040300 10de 22ba snd_hda_intel 7 0
 make_pci 0000:02:00.0 0x030200 1002 73bf amdgpu 8 1
+# AMD-style topology: an unbound host bridge shares the GPU IOMMU group.
+make_pci 0000:00:03.0 0x060000 1022 14da - 9 0
+make_pci 0000:03:00.0 0x030000 1002 7590 amdgpu 9 0
+make_pci 0000:03:00.1 0x040300 1002 1640 snd_hda_intel 9 0
+# A true non-GPU endpoint in the group must still be rejected.
+make_pci 0000:04:00.0 0x030000 1002 744c amdgpu 10 0
+make_pci 0000:05:00.0 0x020000 8086 15f3 - 10 0
 
 cat > "$PROC/cpuinfo" <<'EOF_CPU'
 processor : 0
@@ -76,6 +89,22 @@ cat > "$STATE" <<'EOF_STATE'
     "expanded_devices": {}
   },
   {
+    "name": "vm-host-bridge",
+    "type": "virtual-machine",
+    "status": "Stopped",
+    "location": "node1",
+    "devices": {},
+    "expanded_devices": {}
+  },
+  {
+    "name": "vm-foreign-endpoint",
+    "type": "virtual-machine",
+    "status": "Stopped",
+    "location": "node1",
+    "devices": {},
+    "expanded_devices": {}
+  },
+  {
     "name": "container-one",
     "type": "container",
     "status": "Running",
@@ -100,6 +129,11 @@ case "$bdf" in
     01:00.0) echo '01:00.0 VGA compatible controller: NVIDIA Corporation Test GPU [10de:2684]' ;;
     01:00.1) echo '01:00.1 Audio device: NVIDIA Corporation Test Audio [10de:22ba]' ;;
     02:00.0) echo '02:00.0 3D controller: Advanced Micro Devices, Inc. Test Radeon [1002:73bf]' ;;
+    00:03.0) echo '00:03.0 Host bridge: Advanced Micro Devices, Inc. Test Host Bridge [1022:14da]' ;;
+    03:00.0) echo '03:00.0 VGA compatible controller: Advanced Micro Devices, Inc. Test GPU [1002:7590]' ;;
+    03:00.1) echo '03:00.1 Audio device: Advanced Micro Devices, Inc. Test Audio [1002:1640]' ;;
+    04:00.0) echo '04:00.0 VGA compatible controller: Advanced Micro Devices, Inc. Foreign Group GPU [1002:744c]' ;;
+    05:00.0) echo '05:00.0 Ethernet controller: Intel Corporation Test Ethernet [8086:15f3]' ;;
     *) exit 1 ;;
 esac
 EOF_LSPCI
@@ -344,6 +378,22 @@ test_boot_vga_blocked() {
     state_lacks_device vm-stopped boot-gpu
 }
 
+test_unbound_host_bridge_is_ignored() {
+    local out
+    out=$($TOOL attach vm-host-bridge 0000:03:00.0 --device host-bridge-gpu 2>&1)
+    state_has_device vm-host-bridge host-bridge-gpu 0000:03:00.0 &&         [[ "$out" != *"GPU基板外と思われるPCIエンドポイント"* ]]
+}
+
+test_foreign_endpoint_is_blocked() {
+    local out_file="$TMP/foreign-endpoint.out" out
+    if $TOOL attach vm-foreign-endpoint 0000:04:00.0 --device foreign-group-gpu >"$out_file" 2>&1; then
+        return 1
+    fi
+    out=$(cat "$out_file")
+    state_lacks_device vm-foreign-endpoint foreign-group-gpu && \
+        assert_contains "$out" '0000:05:00.0(class=0x020000,driver=-)'
+}
+
 test_prepare_dry_run() {
     local out
     out=$($TOOL prepare-host --dry-run --yes 2>&1)
@@ -353,19 +403,26 @@ test_prepare_dry_run() {
 test_doctor() {
     local out
     out=$($TOOL doctor --vm vm-running --gpu 1 2>&1)
-    assert_contains "$out" '[OK] Host IOMMU groups are present' && assert_contains "$out" 'VM: vm-running'
+    assert_contains "$out" '[OK] Host IOMMU groups are present' && \
+        assert_contains "$out" 'vfio-pci driver: present' && \
+        assert_contains "$out" 'VM: vm-running'
 }
 
 test_start_failure_rolls_back() {
+    local out_file="$TMP/start-failure.out" out
     export MOCK_FAIL_START_VM=vm-fail
     export MOCK_FAIL_MARKER="$TMP/start-failed-once"
     rm -f "$MOCK_FAIL_MARKER"
-    if $TOOL attach vm-fail 2 --device rollback-gpu --restart --force >/dev/null 2>&1; then
+    if $TOOL attach vm-fail 2 --device rollback-gpu --restart --force \
+        --project app-deploy >"$out_file" 2>&1; then
         unset MOCK_FAIL_START_VM MOCK_FAIL_MARKER
         return 1
     fi
     unset MOCK_FAIL_START_VM MOCK_FAIL_MARKER
-    state_lacks_device vm-fail rollback-gpu && state_is vm-fail Running
+    out=$(cat "$out_file")
+    state_lacks_device vm-fail rollback-gpu && state_is vm-fail Running && \
+        assert_contains "$out" '--- VFIO host state ---' && \
+        assert_contains "$out" 'incus info --show-log vm-fail --project app-deploy'
 }
 
 test_cluster_member_mismatch() {
@@ -387,6 +444,8 @@ run_test 'running VM requires --stop/--restart' test_running_requires_mode
 run_test 'running VM stops and restarts' test_running_restart
 run_test 'duplicate assignment is blocked' test_duplicate_blocked
 run_test 'boot VGA is blocked without --force' test_boot_vga_blocked
+run_test 'unbound host bridge in GPU group is ignored' test_unbound_host_bridge_is_ignored
+run_test 'foreign endpoint in GPU group is still blocked' test_foreign_endpoint_is_blocked
 run_test 'prepare-host dry-run changes nothing' test_prepare_dry_run
 run_test 'doctor validates fixture' test_doctor
 run_test 'start failure rolls back GPU and restores VM' test_start_failure_rolls_back

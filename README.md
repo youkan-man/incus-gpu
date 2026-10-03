@@ -18,6 +18,7 @@ incus config device add <VM> <DEVICE> gpu \
 - Incusクラスタでは、VMを保持するメンバー上で実行しているかを検証
 - 稼働中VMを明示指定により停止し、設定後に再起動
 - VM起動失敗時、追加したGPUデバイスを自動ロールバック
+- VM起動失敗時、VFIOドライバー、IOMMUグループ、`driver_override`、カーネルログを自動採取
 - GPU設定の一覧表示と解除
 - Ubuntu/GRUB向けのIOMMU・VFIO起動設定を明示的なサブコマンドで生成
 - `--dry-run`対応
@@ -74,6 +75,12 @@ No.  PCI BDF      IOMMU   HOST DRIVER   BOOT   DEVICE
 
 ```bash
 incus-gpu doctor --vm ai-vm --gpu 1
+```
+
+VFIOへのバインド失敗まで調べる場合は、カーネルログも含めます。カーネルログの閲覧権限がない環境では`sudo`を付けてください。
+
+```bash
+sudo incus-gpu doctor --vm ai-vm --gpu 1 --kernel-log
 ```
 
 IOMMUグループが無い場合、まずBIOS/UEFIでVT-dまたはAMD-Viを有効にします。その後、Ubuntu側の起動設定が必要なら次を実行します。
@@ -136,7 +143,7 @@ incus-gpu status ai-vm
 - `physical`等のGPUタイプ
 - VM本体設定かプロファイル由来か
 - 現在のホストドライバー
-- IOMMUグループ
+- IOMMUグループ（未バインドのホストブリッジなど、割当不要なブリッジは除外）
 
 ## GPU設定の解除
 
@@ -170,7 +177,7 @@ incus-gpu detach ai-vm --device gpu-41-00-0 --restart
 
 ```text
 incus-gpu list
-incus-gpu doctor [--vm VM] [--gpu GPU]
+incus-gpu doctor [--vm VM] [--gpu GPU] [--project NAME] [--kernel-log]
 incus-gpu attach VM GPU [options]
 incus-gpu detach VM [GPU] [options]
 incus-gpu status VM
@@ -199,6 +206,15 @@ incus-gpu ai-vm 1 --restart
 | `--dry-run` | 変更コマンドを表示するだけ |
 
 `--force`は、内容を理解している場合にだけ使用してください。特にboot VGAやホストの表示サーバーが使っているGPUを外すと、ホスト画面が消える可能性があります。
+
+## doctorオプション
+
+| オプション | 内容 |
+|---|---|
+| `--vm VM` | 対象VMの種類、状態、配置メンバー、設定済みGPUを確認 |
+| `--gpu GPU` | 対象GPU、IOMMUグループ、グループ内PCI機能を確認 |
+| `--project NAME` | Incusプロジェクトを指定 |
+| `--kernel-log` | GPU、VFIO、IOMMU、AMD GPUに関係する直近のカーネルログを表示 |
 
 ## prepare-hostが変更するもの
 
@@ -270,9 +286,48 @@ incus-gpu attach ai-vm 1 --stop
 
 失敗した設定を残して調査したい場合だけ、`--keep-on-failure`を付けます。
 
+起動失敗時は、ロールバック前に次の情報も自動表示します。
+
+- `vfio-pci`ドライバーが登録されているか
+- IOMMUグループ番号と`/dev/vfio/<group>`の有無
+- グループ内各PCI機能のクラス、現在のドライバー、`driver_override`
+- 対象GPU、VFIO、IOMMUに関係する起動試行直後のカーネルログ
+- `--project`を含む正しい`incus info --show-log`コマンド
+
 ### IOMMUグループ検査
 
-GPUと同じIOMMUグループに、GPU基板上の音声・USB機能以外のPCIエンドポイントが含まれる場合は停止します。PCIeブリッジは警告対象から除外します。
+GPUと同じIOMMUグループに、GPU基板上の音声・USB機能以外のPCIエンドポイントが含まれる場合は停止します。PCI-to-PCIブリッジ、およびホストドライバーへバインドされていないホストブリッジ等のブリッジクラスは、VFIOへ割り当てるエンドポイントではないため警告対象から除外します。
+
+## VFIOバインド失敗の調査
+
+次のエラーは、IncusがQEMUを起動する前に、対象PCI機能を`vfio-pci`へ切り替えられなかったことを示します。
+
+```text
+Failed to override IOMMU group driver:
+Device took too long to activate at "/sys/bus/pci/drivers/vfio-pci/..."
+```
+
+まず、対象VMを停止・変更せずに診断します。
+
+```bash
+sudo incus-gpu doctor \
+  --vm ai-vm \
+  --gpu 0000:41:00.0 \
+  --project my-project \
+  --kernel-log
+```
+
+`incus info --show-log`の`Log:`が空でも、異常なしとは限りません。PCIドライバーの切り替え段階で失敗した場合はQEMU自体がまだ起動していないため、原因は主にホストのカーネルログへ出ます。
+
+確認の中心は次です。
+
+```bash
+sudo modprobe vfio-pci
+ls -ld /sys/bus/pci/drivers/vfio-pci
+sudo journalctl -k -b --no-pager | grep -Ei 'vfio|iommu|41:00'
+```
+
+GPUのPCI BDFに合わせて`41:00`部分を置き換えてください。恒久的な`vfio-pci.ids=`設定や手動アンバインドはホストの表示を失う可能性があるため、本ツールは診断結果なしに自動適用しません。
 
 ## ゲスト側
 
@@ -317,10 +372,14 @@ make test
 - boot VGA保護
 - `prepare-host --dry-run`
 - `doctor`
+- `doctor`のVFIO状態表示
 - GPU追加後の起動失敗ロールバック
+- 起動失敗時のプロジェクト付き診断案内
 - Incusクラスタの実行メンバー不一致防止
+- GPUと同一グループの未バインドホストブリッジを誤検出しないこと
+- GPUと同一グループの実エンドポイントは引き続き拒否すること
 
-合計13項目を検証します。
+合計15項目を検証します。
 
 ## 参考
 

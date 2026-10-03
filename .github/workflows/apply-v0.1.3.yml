@@ -28,13 +28,16 @@ jobs:
           text = path.read_text()
           for option in ('timeout', 'keep-on-failure', 'prebind-vfio', 'vfio-timeout'):
               text = text.replace(f'\n                --{option})', f'\n            --{option})')
-          for command in ('detach|remove|rm)', 'bind-vfio|bind)', 'release-vfio|release)', 'status|show)'):
+          for command in (
+              'detach|remove|rm)',
+              'status|show)',
+              'bind-vfio|vfio-bind)',
+              'release-vfio|vfio-release|unbind-vfio)',
+              'prepare-host|prepare)',
+          ):
               text = text.replace(f'\n            {command}', f'\n        {command}')
           path.write_text(text)
           PY
-          nl -ba /tmp/apply-v0.1.3.py | sed -n '423,520p'
-          printf '%s\n' '--- target main ---'
-          grep -n -A 10 -B 2 'attach|add' incus-gpu
           python3 /tmp/apply-v0.1.3.py
 
       - name: Test

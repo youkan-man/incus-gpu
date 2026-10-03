@@ -28,6 +28,8 @@ jobs:
           text = path.read_text()
           for option in ('timeout', 'keep-on-failure', 'prebind-vfio', 'vfio-timeout'):
               text = text.replace(f'\n                --{option})', f'\n            --{option})')
+          for command in ('detach|remove|rm)', 'bind-vfio|bind)', 'release-vfio|release)', 'status|show)'):
+              text = text.replace(f'\n            {command}', f'\n        {command}')
           path.write_text(text)
           PY
           python3 /tmp/apply-v0.1.3.py

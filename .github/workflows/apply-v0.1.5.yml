@@ -5,7 +5,7 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/apply-v0.1.5.yml'
-      - '.github/scripts/apply-v0.1.5.py.gz'
+      - '.github/scripts/apply-v0.1.5.py.gz.b64.part*'
 
 permissions:
   contents: write
@@ -18,7 +18,9 @@ jobs:
         with:
           fetch-depth: 0
       - name: Apply changes
-        run: gzip -dc .github/scripts/apply-v0.1.5.py.gz | python3
+        run: |
+          cat .github/scripts/apply-v0.1.5.py.gz.b64.part* > /tmp/apply-v0.1.5.py.gz.b64
+          base64 -d /tmp/apply-v0.1.5.py.gz.b64 | gzip -dc | python3
       - name: Test
         run: |
           git diff --check

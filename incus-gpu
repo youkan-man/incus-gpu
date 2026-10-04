@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="0.1.4"
+VERSION="0.1.5"
 PROG="${0##*/}"
 
 SYSFS_ROOT="${INCUS_GPU_SYSFS_ROOT:-/sys}"
@@ -23,6 +23,12 @@ STOP_TIMEOUT=60
 KEEP_ON_START_FAILURE=0
 PREBIND_VFIO=0
 VFIO_BIND_TIMEOUT=15
+SYSFS_WRITE_STUCK_PID=""
+SYSFS_WRITE_STUCK_PATH=""
+SYSFS_WRITE_STUCK_LABEL=""
+SYSFS_WRITE_STUCK_STATE=""
+SYSFS_WRITE_STUCK_WCHAN=""
+SYSFS_WRITE_STUCK_TMPDIR=""
 INCUS_LIST_JSON=""
 VM_TYPE=""
 VM_STATUS=""
@@ -90,7 +96,7 @@ attach/detachオプション:
   --force               boot VGA、使用中GPU、重複割当等の保護を解除
   --prebind-vfio        Incus起動前にGPU機能をvfio-pciへ事前バインド
   --vfio-timeout SEC    事前バインドの待機秒数（既定: 15）
-                       失敗時は直接bindのerrno、PCI/BAR、カーネルログを表示
+                       bind/probe書込みも監視し、カーネル停止時でも制御を返す
   --keep-on-failure     attach後のVM起動失敗時にGPU設定を残す
   --dry-run             変更コマンドを表示するだけ
 
@@ -565,7 +571,7 @@ sysfs_write_checked() {
     }
 
     err_file=$(mktemp)
-    if printf '%s\n' "$value" >"$path" 2>"$err_file"; then
+    if printf '%s\n' "$value" 2>"$err_file" >"$path"; then
         rm -f "$err_file"
         return 0
     else
@@ -575,6 +581,101 @@ sysfs_write_checked() {
         warn "$label に失敗しました (exit=$rc, path=$path): ${err:-kernel rejected the write}"
         return "$rc"
     fi
+}
+
+sysfs_write_watchdog() {
+    local value=$1 path=$2 label=${3:-sysfs-write} timeout=${4:-$VFIO_BIND_TIMEOUT}
+    local work_dir err_file rc_file worker_pid deadline rc err state wchan
+
+    if (( DRY_RUN )); then
+        printf '+ write %q > %q  # %s (watchdog=%ss)\n' \
+            "$value" "$path" "$label" "$timeout" >&2
+        return 0
+    fi
+
+    [[ -e "$path" ]] || {
+        warn "$label: sysfsパスがありません: $path"
+        return 1
+    }
+
+    SYSFS_WRITE_STUCK_PID=""
+    SYSFS_WRITE_STUCK_PATH=""
+    SYSFS_WRITE_STUCK_LABEL=""
+    SYSFS_WRITE_STUCK_STATE=""
+    SYSFS_WRITE_STUCK_WCHAN=""
+    SYSFS_WRITE_STUCK_TMPDIR=""
+
+    work_dir=$(mktemp -d)
+    err_file="$work_dir/stderr"
+    rc_file="$work_dir/rc"
+
+    (
+        set +e
+        # stderrを先にリダイレクトし、sysfsのopen/writeエラーも採取する。
+        printf '%s\n' "$value" 2>"$err_file" >"$path"
+        rc=$?
+        printf '%s\n' "$rc" >"$rc_file"
+        exit "$rc"
+    ) &
+    worker_pid=$!
+    deadline=$((SECONDS + timeout))
+
+    while [[ ! -s "$rc_file" ]]; do
+        if ! kill -0 "$worker_pid" 2>/dev/null; then
+            break
+        fi
+
+        if (( SECONDS >= deadline )); then
+            warn "$label が${timeout}秒を超えて応答しません。監視ワーカーPID=$worker_pid"
+            kill -TERM "$worker_pid" 2>/dev/null || true
+            sleep 0.5
+            kill -KILL "$worker_pid" 2>/dev/null || true
+            sleep 0.5
+
+            state=$(ps -o stat= -p "$worker_pid" 2>/dev/null | awk '{print $1}' || true)
+            if [[ "$state" == Z* || -z "$state" ]]; then
+                wait "$worker_pid" 2>/dev/null || true
+                err=$(tr '\n' ' ' <"$err_file" 2>/dev/null || true)
+                rm -rf "$work_dir"
+                warn "$label をタイムアウトで中断しました。${err:+詳細: $err}"
+                return 124
+            fi
+
+            wchan=$(cat "/proc/$worker_pid/wchan" 2>/dev/null || true)
+            SYSFS_WRITE_STUCK_PID=$worker_pid
+            SYSFS_WRITE_STUCK_PATH=$path
+            SYSFS_WRITE_STUCK_LABEL=$label
+            SYSFS_WRITE_STUCK_STATE=$state
+            SYSFS_WRITE_STUCK_WCHAN=${wchan:-unknown}
+            SYSFS_WRITE_STUCK_TMPDIR=$work_dir
+            disown "$worker_pid" 2>/dev/null || true
+
+            warn "sysfsワーカーがカーネル待ちのまま残っています: pid=$worker_pid state=$state wchan=${wchan:-unknown}"
+            warn "このPCI操作はまだ進行中の可能性があるため、復元・VM再起動を自動実行しません。"
+            warn "確認: ps -o pid,ppid,stat,wchan:32,cmd -p $worker_pid"
+            warn "state=Dのままなら、通常のkillでは解消せずホスト再起動が必要です。"
+            return 124
+        fi
+
+        sleep 0.1
+    done
+
+    if [[ -s "$rc_file" ]]; then
+        rc=$(cat "$rc_file" 2>/dev/null || printf '1')
+    else
+        wait "$worker_pid" 2>/dev/null
+        rc=$?
+    fi
+    wait "$worker_pid" 2>/dev/null || true
+    err=$(tr '\n' ' ' <"$err_file" 2>/dev/null || true)
+    rm -rf "$work_dir"
+
+    if (( rc == 0 )); then
+        return 0
+    fi
+
+    warn "$label に失敗しました (exit=$rc, path=$path): ${err:-kernel rejected the write}"
+    return "$rc"
 }
 
 load_vfio_pci_driver() {
@@ -619,7 +720,7 @@ unbind_pci_function() {
 }
 
 bind_pci_function_to_vfio() {
-    local bdf=$1 timeout=$2 current override_path bind_path probe_path bind_epoch
+    local bdf=$1 timeout=$2 current override_path bind_path probe_path bind_epoch rc
     current=$(pci_driver "$bdf")
     if [[ "$current" == "vfio-pci" ]]; then
         info "$bdf は既にvfio-pciへバインドされています。"
@@ -636,21 +737,35 @@ bind_pci_function_to_vfio() {
     probe_path="$SYSFS_ROOT/bus/pci/drivers_probe"
     bind_epoch=$(date +%s)
 
-    # Writing directly to vfio-pci/bind returns the kernel errno to the caller.
-    # drivers_probe often hides that detail and only leaves the device unbound.
+    # PCI driver probeはカーネル内で長時間停止することがあるため、
+    # メインシェルでは実行せず監視付きワーカーへ分離する。
     if [[ -e "$bind_path" ]] || (( DRY_RUN )); then
-        if ! sysfs_write_checked "$bdf" "$bind_path" "vfio-pci direct bind ($bdf)"; then
-            warn "$bdf のvfio-pci probeがカーネルに拒否されました。"
+        if sysfs_write_watchdog "$bdf" "$bind_path" \
+            "vfio-pci direct bind ($bdf)" "$timeout"; then
+            :
+        else
+            rc=$?
+            if [[ -n "$SYSFS_WRITE_STUCK_PID" ]]; then
+                return 124
+            fi
+            warn "$bdf のvfio-pci probeが完了しませんでした。"
             print_pci_diagnostics "$bdf"
             print_kernel_vfio_log "$bdf" "$bind_epoch"
-            return 1
+            return "$rc"
         fi
     else
         warn "vfio-pci/bindが無いためdrivers_probeへフォールバックします。"
-        if ! sysfs_write_checked "$bdf" "$probe_path" "PCI drivers_probe ($bdf)"; then
+        if sysfs_write_watchdog "$bdf" "$probe_path" \
+            "PCI drivers_probe ($bdf)" "$timeout"; then
+            :
+        else
+            rc=$?
+            if [[ -n "$SYSFS_WRITE_STUCK_PID" ]]; then
+                return 124
+            fi
             print_pci_diagnostics "$bdf"
             print_kernel_vfio_log "$bdf" "$bind_epoch"
-            return 1
+            return "$rc"
         fi
     fi
 
@@ -706,7 +821,7 @@ restore_prebound_vfio() {
 }
 
 prebind_vfio_functions() {
-    local bdf=$1 timeout=$2 function original_driver original_override group current
+    local bdf=$1 timeout=$2 function original_driver original_override group current rc
     local vfio_count=0 host_count=0
     local -a functions=()
     PREBOUND_FUNCTIONS=()
@@ -753,12 +868,23 @@ prebind_vfio_functions() {
         PREBIND_ORIGINAL_DRIVER["$function"]=$original_driver
         PREBIND_ORIGINAL_OVERRIDE["$function"]=$original_override
 
-        if ! bind_pci_function_to_vfio "$function" "$timeout"; then
-            warn "VFIO事前バインドに失敗しました: $function"
-            print_vfio_state "$bdf"
-            restore_prebound_vfio || true
-            return 1
+        if bind_pci_function_to_vfio "$function" "$timeout"; then
+            continue
+        else
+            rc=$?
         fi
+
+        warn "VFIO事前バインドに失敗しました: $function"
+        if [[ -n "$SYSFS_WRITE_STUCK_PID" ]]; then
+            warn "カーネル内のbind/probeが終了していないため、PCI状態の復元を省略します。"
+            warn "対象: $SYSFS_WRITE_STUCK_LABEL path=$SYSFS_WRITE_STUCK_PATH"
+            warn "worker: pid=$SYSFS_WRITE_STUCK_PID state=$SYSFS_WRITE_STUCK_STATE wchan=$SYSFS_WRITE_STUCK_WCHAN"
+            return 124
+        fi
+
+        print_vfio_state "$bdf"
+        restore_prebound_vfio || true
+        return "$rc"
     done
 
     print_vfio_state "$bdf"
@@ -1243,13 +1369,23 @@ cmd_attach() {
     stop_vm_for_change "$vm"
 
     if (( prebind_requested )); then
+        local prebind_rc=0
         info "Incus起動前にGPU関連PCI機能をvfio-pciへ事前バインドします。"
-        if ! prebind_vfio_functions "$bdf" "$vfio_timeout"; then
+        if prebind_vfio_functions "$bdf" "$vfio_timeout"; then
+            :
+        else
+            prebind_rc=$?
+            if [[ -n "$SYSFS_WRITE_STUCK_PID" ]]; then
+                warn "PCI probeがカーネル内で継続中のため、VM '$vm' は停止したままにします。"
+                warn "別端末で次を確認してください: ps -o pid,ppid,stat,wchan:32,cmd -p $SYSFS_WRITE_STUCK_PID"
+                warn "state=Dのままなら、ホスト再起動後にVMを起動してください。"
+                die "VFIO bind/probeが監視時間を超過しました（worker PID=$SYSFS_WRITE_STUCK_PID）。"
+            fi
             if (( VM_ORIGINALLY_RUNNING && ! DRY_RUN )); then
                 warn "事前バインド失敗のため、元の構成でVM '$vm' を再起動します。"
                 incus_read start "$vm" || warn "元の構成でもVMを再起動できませんでした。"
             fi
-            die "VFIO事前バインドに失敗したため、Incusデバイスは追加しません。"
+            die "VFIO事前バインドに失敗しました (exit=$prebind_rc)。Incusデバイスは追加しません。"
         fi
     fi
 

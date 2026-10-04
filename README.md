@@ -154,6 +154,30 @@ sudo incus-gpu bind-vfio 0000:41:00.0 --timeout 15
 sudo incus-gpu release-vfio 0000:41:00.0
 ```
 
+## bind/probe書き込み自体が停止する場合
+
+`vfio-pci/bind`や`drivers_probe`へのsysfs書き込みは、PCIドライバーのprobeが
+カーネル内で停止すると、呼び出したシェルまで応答しなくなることがあります。
+`0.1.5`以降はこの書き込みを監視付きワーカーへ分離し、`--vfio-timeout`を
+超えた時点でメイン処理へ制御を戻します。
+
+ワーカーが通常のシグナルで終了できた場合は、変更済み状態を復元して終了します。
+一方、ワーカーが`D`（uninterruptible sleep）のまま残った場合は、処理がまだ
+カーネル内で進行中である可能性があるため、競合を避けて次を自動実行しません。
+
+- `driver_override`やPCIドライバーの復元
+- 停止したVMの再起動
+- Incus GPUデバイスの追加
+
+出力されたPIDを別端末から確認してください。
+
+```bash
+ps -o pid,ppid,stat,wchan:32,cmd -p <worker-pid>
+```
+
+`STAT`が`D`のままなら、通常の`kill`は処理を即座には終了させません。
+ホストを再起動してPCI probeを解消した後、VMを起動してください。
+
 ## 状態確認
 
 ```bash
@@ -450,10 +474,11 @@ make test
 - Incusクラスタの実行メンバー不一致防止
 - GPUと同一グループの未バインドホストブリッジを誤検出しないこと
 - GPUと同一グループの実エンドポイントは引き続き拒否すること
+- 応答しないsysfs bindから監視時間内に制御が戻ること
 - `bind-vfio --dry-run`がGPU本体と同一スロット機能だけを対象にすること
 - `attach --prebind-vfio --dry-run`がIncus設定前にVFIO操作を組み立てること
 
-合計17項目を検証します。
+合計18項目を検証します。
 
 ## 参考
 

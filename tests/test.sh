@@ -414,6 +414,43 @@ test_attach_prebind_dry_run() {
         assert_contains "$out" 'config device add'
 }
 
+test_bind_write_watchdog_returns() {
+    local bind_path="$SYS/bus/pci/drivers/vfio-pci/bind"
+    local out_file="$TMP/bind-watchdog.out" out rc elapsed start
+
+    rm -f "$SYS/bus/pci/devices/0000:03:00.0/driver"
+    touch "$SYS/bus/pci/drivers_probe"
+    rm -f "$bind_path"
+    mkfifo "$bind_path"
+
+    start=$SECONDS
+    if timeout 8 "$TOOL" bind-vfio 0000:03:00.0 --force --timeout 1 \
+        >"$out_file" 2>&1; then
+        rc=0
+    else
+        rc=$?
+    fi
+    elapsed=$((SECONDS - start))
+    rm -f "$bind_path"
+    out=$(cat "$out_file")
+    if ! (( rc != 0 && elapsed < 5 )); then
+        printf 'watchdog timing/status mismatch: rc=%s elapsed=%s\n%s\n' \
+            "$rc" "$elapsed" "$out" >&2
+        return 1
+    fi
+    if ! assert_contains "$out" '監視ワーカーPID='; then
+        printf 'watchdog PID output missing: rc=%s elapsed=%s\n%s\n' \
+            "$rc" "$elapsed" "$out" >&2
+        return 1
+    fi
+    if [[ "$out" != *"タイムアウトで中断しました"* && \
+          "$out" != *"sysfsワーカーがカーネル待ち"* ]]; then
+        printf 'watchdog timeout output missing: rc=%s elapsed=%s\n%s\n' \
+            "$rc" "$elapsed" "$out" >&2
+        return 1
+    fi
+}
+
 test_prepare_dry_run() {
     local out
     out=$($TOOL prepare-host --dry-run --yes 2>&1)
@@ -472,6 +509,7 @@ run_test 'prepare-host dry-run changes nothing' test_prepare_dry_run
 run_test 'doctor validates fixture' test_doctor
 run_test 'start failure rolls back GPU and restores VM' test_start_failure_rolls_back
 run_test 'cluster member mismatch is blocked' test_cluster_member_mismatch
+run_test 'blocking sysfs bind returns via watchdog' test_bind_write_watchdog_returns
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 ((fail == 0))

@@ -451,6 +451,40 @@ test_bind_write_watchdog_returns() {
     fi
 }
 
+test_driver_override_write_watchdog_returns() {
+    local out
+    out=$($TOOL bind-vfio 0000:03:00.0 --force --timeout 7 --dry-run 2>&1)
+    assert_contains "$out" 'driver_override設定 (0000:03:00.0)' && \
+        assert_contains "$out" '(watchdog=7s)'
+}
+test_inspect_single_command_restores_vm() {
+    local bind_path="$SYS/bus/pci/drivers/vfio-pci/bind"
+    local out_file="$TMP/inspect-watchdog.out" out rc elapsed start
+
+    rm -f "$SYS/bus/pci/devices/0000:03:00.0/driver"
+    printf '(null)\n' > "$SYS/bus/pci/devices/0000:03:00.0/driver_override"
+    rm -f "$bind_path"
+    mkfifo "$bind_path"
+
+    start=$SECONDS
+    if timeout 10 "$TOOL" inspect vm-running 0000:03:00.0 \
+        --project app-deploy --timeout 1 --force >"$out_file" 2>&1; then
+        rc=0
+    else
+        rc=$?
+    fi
+    elapsed=$((SECONDS - start))
+    rm -f "$bind_path"
+    : > "$bind_path"
+    out=$(cat "$out_file")
+
+    (( rc != 0 && elapsed < 8 )) && \
+        state_is vm-running Running && \
+        assert_contains "$out" '=== inspection summary ===' && \
+        assert_contains "$out" 'result=FAIL' && \
+        assert_contains "$out" 'final_status=Running'
+}
+
 test_prepare_dry_run() {
     local out
     out=$($TOOL prepare-host --dry-run --yes 2>&1)
@@ -509,7 +543,9 @@ run_test 'prepare-host dry-run changes nothing' test_prepare_dry_run
 run_test 'doctor validates fixture' test_doctor
 run_test 'start failure rolls back GPU and restores VM' test_start_failure_rolls_back
 run_test 'cluster member mismatch is blocked' test_cluster_member_mismatch
+run_test 'blocking driver_override returns via watchdog' test_driver_override_write_watchdog_returns
 run_test 'blocking sysfs bind returns via watchdog' test_bind_write_watchdog_returns
+run_test 'inspect is one command and restores VM' test_inspect_single_command_restores_vm
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 ((fail == 0))

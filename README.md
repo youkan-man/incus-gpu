@@ -485,3 +485,22 @@ make test
 - Incus GPU device: https://linuxcontainers.org/incus/docs/main/reference/devices_gpu/
 - Incus PCI device: https://linuxcontainers.org/incus/docs/main/reference/devices_pci/
 - Incus instance options: https://linuxcontainers.org/incus/docs/main/reference/instance_options/
+
+
+## 単独コマンドでVFIO精査
+
+VM停止、GPU関連機能のVFIOバインド試験、PCI/IOMMU/カーネル情報の採取、PCI状態の復元、元々稼働していたVMの再起動までを1回で実行します。
+
+```bash
+sudo incus-gpu inspect <VM> <GPU> --project <PROJECT>
+```
+
+例:
+
+```bash
+sudo incus-gpu inspect sb-436b44fcd4fe 1 --project app-deploy
+```
+
+既定では、unbind、`driver_override`、`vfio-pci/bind`、`drivers_probe`、復元処理の各sysfs書き込みを15秒監視します。カーネル内で書き込みが停止してもメインCLIは監視時間後に制御を戻します。
+
+通常の失敗ではPCI状態を復元し、元々稼働していたVMを再起動します。ワーカーが割り込み不能な`D`状態で残った場合だけ、安全のためPCI復元とVM再起動を行わず、`result=KERNEL_WAIT`、PID、`wchan`を出力します。

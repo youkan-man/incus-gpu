@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="0.1.5"
+VERSION="0.1.6"
 PROG="${0##*/}"
 
 SYSFS_ROOT="${INCUS_GPU_SYSFS_ROOT:-/sys}"
@@ -67,6 +67,7 @@ ${C_BOLD}incus-gpu ${VERSION}${C_RESET} - Ubuntu/Incus VM向けGPUパススル�
 使い方:
   ${PROG} list
   ${PROG} doctor [--vm VM] [--gpu GPU] [--kernel-log]
+  sudo ${PROG} inspect VM GPU [--project NAME] [--timeout SEC]
   ${PROG} attach VM GPU [オプション]
   ${PROG} detach VM [GPU] [オプション]
   ${PROG} status VM
@@ -106,9 +107,17 @@ doctorオプション:
   --project NAME        Incusプロジェクト
   --kernel-log          対象GPU、VFIO、IOMMUに関係するカーネルログも表示
 
+inspectオプション:
+  --project NAME        Incusプロジェクト
+  --timeout SEC         各PCI sysfs操作の監視秒数（既定: 15）
+  --force-stop          VMの通常停止失敗時に強制停止
+  --force               保護判定を解除して精査
+  --dry-run             停止・PCI操作・復旧コマンドだけを表示
+
 例:
   ${PROG} list
   ${PROG} doctor --vm ai-vm --gpu 1 --kernel-log
+  sudo ${PROG} inspect ai-vm 0000:41:00.0 --project default
   ${PROG} attach ai-vm 0000:41:00.0 --restart
   ${PROG} detach ai-vm 0000:41:00.0 --restart
 EOF_USAGE
@@ -712,11 +721,18 @@ wait_for_pci_driver() {
 }
 
 unbind_pci_function() {
-    local bdf=$1 driver unbind_path
+    local bdf=$1 timeout=${2:-$VFIO_BIND_TIMEOUT} driver unbind_path rc
     driver=$(pci_driver "$bdf")
     [[ "$driver" == "-" ]] && return 0
     unbind_path="$SYSFS_ROOT/bus/pci/drivers/$driver/unbind"
-    sysfs_write "$bdf" "$unbind_path"
+
+    if sysfs_write_watchdog "$bdf" "$unbind_path" \
+        "PCI driver unbind ($bdf from $driver)" "$timeout"; then
+        return 0
+    else
+        rc=$?
+        return "$rc"
+    fi
 }
 
 bind_pci_function_to_vfio() {
@@ -728,10 +744,27 @@ bind_pci_function_to_vfio() {
     fi
 
     info "$bdf を${current}からvfio-pciへ切り替えます。"
-    unbind_pci_function "$bdf" || return 1
+    if unbind_pci_function "$bdf" "$timeout"; then
+        :
+    else
+        rc=$?
+        [[ -n "$SYSFS_WRITE_STUCK_PID" ]] && return 124
+        warn "$bdf のホストドライバー解除に失敗しました。"
+        print_pci_diagnostics "$bdf"
+        return "$rc"
+    fi
 
     override_path="$(pci_path "$bdf")/driver_override"
-    sysfs_write_checked 'vfio-pci' "$override_path" "driver_override設定 ($bdf)" || return 1
+    if sysfs_write_watchdog 'vfio-pci' "$override_path" \
+        "driver_override設定 ($bdf)" "$timeout"; then
+        :
+    else
+        rc=$?
+        [[ -n "$SYSFS_WRITE_STUCK_PID" ]] && return 124
+        warn "$bdf のdriver_override設定が完了しませんでした。"
+        print_pci_diagnostics "$bdf"
+        return "$rc"
+    fi
 
     bind_path="$SYSFS_ROOT/bus/pci/drivers/vfio-pci/bind"
     probe_path="$SYSFS_ROOT/bus/pci/drivers_probe"
@@ -745,9 +778,7 @@ bind_pci_function_to_vfio() {
             :
         else
             rc=$?
-            if [[ -n "$SYSFS_WRITE_STUCK_PID" ]]; then
-                return 124
-            fi
+            [[ -n "$SYSFS_WRITE_STUCK_PID" ]] && return 124
             warn "$bdf のvfio-pci probeが完了しませんでした。"
             print_pci_diagnostics "$bdf"
             print_kernel_vfio_log "$bdf" "$bind_epoch"
@@ -760,9 +791,7 @@ bind_pci_function_to_vfio() {
             :
         else
             rc=$?
-            if [[ -n "$SYSFS_WRITE_STUCK_PID" ]]; then
-                return 124
-            fi
+            [[ -n "$SYSFS_WRITE_STUCK_PID" ]] && return 124
             print_pci_diagnostics "$bdf"
             print_kernel_vfio_log "$bdf" "$bind_epoch"
             return "$rc"
@@ -779,25 +808,45 @@ bind_pci_function_to_vfio() {
 }
 
 restore_pci_function() {
-    local bdf=$1 original_driver=$2 original_override=$3 current override_path
+    local bdf=$1 original_driver=$2 original_override=$3 timeout=${4:-$VFIO_BIND_TIMEOUT}
+    local current override_path restore_override rc
     current=$(pci_driver "$bdf")
     if [[ "$current" != "-" ]]; then
-        unbind_pci_function "$bdf" || return 1
+        if unbind_pci_function "$bdf" "$timeout"; then
+            :
+        else
+            rc=$?
+            return "$rc"
+        fi
     fi
 
     override_path="$(pci_path "$bdf")/driver_override"
     if [[ "$original_override" == "-" ]]; then
-        sysfs_write '' "$override_path" || return 1
+        restore_override=''
     else
-        sysfs_write "$original_override" "$override_path" || return 1
+        restore_override=$original_override
+    fi
+
+    if sysfs_write_watchdog "$restore_override" "$override_path" \
+        "driver_override復元 ($bdf)" "$timeout"; then
+        :
+    else
+        rc=$?
+        return "$rc"
     fi
 
     if [[ "$original_driver" != "-" ]]; then
         if command -v modprobe >/dev/null 2>&1; then
             modprobe "$original_driver" >/dev/null 2>&1 || true
         fi
-        sysfs_write "$bdf" "$SYSFS_ROOT/bus/pci/drivers_probe" || return 1
-        if ! wait_for_pci_driver "$bdf" "$original_driver" "$VFIO_BIND_TIMEOUT"; then
+        if sysfs_write_watchdog "$bdf" "$SYSFS_ROOT/bus/pci/drivers_probe" \
+            "PCI driver復元probe ($bdf -> $original_driver)" "$timeout"; then
+            :
+        else
+            rc=$?
+            return "$rc"
+        fi
+        if ! wait_for_pci_driver "$bdf" "$original_driver" "$timeout"; then
             warn "$bdf を元のドライバー $original_driver へ戻せませんでした。"
             return 1
         fi
@@ -805,14 +854,21 @@ restore_pci_function() {
 }
 
 restore_prebound_vfio() {
-    local index bdf failed=0
+    local index bdf failed=0 rc
     ((${#PREBOUND_FUNCTIONS[@]} > 0)) || return 0
     warn "事前バインドしたPCI機能を元の状態へ戻します。"
     for ((index=${#PREBOUND_FUNCTIONS[@]}-1; index>=0; index--)); do
         bdf=${PREBOUND_FUNCTIONS[index]}
-        restore_pci_function "$bdf" \
+        if restore_pci_function "$bdf" \
             "${PREBIND_ORIGINAL_DRIVER[$bdf]}" \
-            "${PREBIND_ORIGINAL_OVERRIDE[$bdf]}" || failed=1
+            "${PREBIND_ORIGINAL_OVERRIDE[$bdf]}" "$VFIO_BIND_TIMEOUT"; then
+            :
+        else
+            rc=$?
+            failed=1
+            warn "$bdf のPCI状態を完全には復元できませんでした (exit=$rc)。"
+            [[ -n "$SYSFS_WRITE_STUCK_PID" ]] && break
+        fi
     done
     PREBOUND_FUNCTIONS=()
     PREBIND_ORIGINAL_DRIVER=()
@@ -891,7 +947,7 @@ prebind_vfio_functions() {
 }
 
 release_vfio_functions() {
-    local bdf=$1 group function current changed=0
+    local bdf=$1 group function current changed=0 rc
     local -a functions=()
     require_sysfs_write_access || return 1
     group=$(pci_iommu_group "$bdf")
@@ -909,9 +965,26 @@ release_vfio_functions() {
         [[ "$current" == "vfio-pci" ]] || continue
         changed=1
         info "$function をvfio-pciから解放してホストへ再probeします。"
-        unbind_pci_function "$function" || return 1
-        sysfs_write '' "$(pci_path "$function")/driver_override" || return 1
-        sysfs_write "$function" "$SYSFS_ROOT/bus/pci/drivers_probe" || return 1
+        if unbind_pci_function "$function" "$VFIO_BIND_TIMEOUT"; then
+            :
+        else
+            rc=$?
+            return "$rc"
+        fi
+        if sysfs_write_watchdog '' "$(pci_path "$function")/driver_override" \
+            "driver_override解除 ($function)" "$VFIO_BIND_TIMEOUT"; then
+            :
+        else
+            rc=$?
+            return "$rc"
+        fi
+        if sysfs_write_watchdog "$function" "$SYSFS_ROOT/bus/pci/drivers_probe" \
+            "ホストドライバー再probe ($function)" "$VFIO_BIND_TIMEOUT"; then
+            :
+        else
+            rc=$?
+            return "$rc"
+        fi
         if (( ! DRY_RUN )); then
             sleep 0.2
             info "$function の現在のドライバー: $(pci_driver "$function")"
@@ -1256,6 +1329,114 @@ cmd_bind_vfio() {
         die "GPUをvfio-pciへ事前バインドできませんでした。上のカーネルログを確認してください。"
     ok "VFIO事前バインドが完了しました: pci=$bdf"
     warn "ホストへ戻す場合は 'sudo ${PROG} release-vfio $bdf' を実行してください。"
+}
+
+cmd_inspect() {
+    local vm="" selector="" bdf="" existing_line=""
+    local timeout=$VFIO_BIND_TIMEOUT rc=0 bind_ok=0 restore_ok=1 vm_restore_ok=1
+    local original_status="" final_status="unknown"
+    local -a positional=()
+
+    while (($#)); do
+        case "$1" in
+            --vm) [[ $# -ge 2 ]] || die "--vmに値が必要です"; vm=$2; shift 2 ;;
+            --gpu) [[ $# -ge 2 ]] || die "--gpuに値が必要です"; selector=$2; shift 2 ;;
+            --project) [[ $# -ge 2 ]] || die "--projectに値が必要です"; PROJECT=$2; shift 2 ;;
+            --timeout|--vfio-timeout) [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || die "$1には秒数が必要です"; timeout=$2; shift 2 ;;
+            --stop-timeout) [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || die "--stop-timeoutには秒数が必要です"; STOP_TIMEOUT=$2; shift 2 ;;
+            --force-stop) FORCE_STOP=1; shift ;;
+            --force) FORCE=1; shift ;;
+            --dry-run) DRY_RUN=1; shift ;;
+            -h|--help) usage; return 0 ;;
+            -*) die "inspectの不明なオプションです: $1" ;;
+            *) positional+=("$1"); shift ;;
+        esac
+    done
+
+    [[ -n "$vm" ]] || vm=${positional[0]:-}
+    [[ -n "$selector" ]] || selector=${positional[1]:-}
+    ((${#positional[@]} <= 2)) || die "inspectの位置引数が多すぎます。"
+    [[ -n "$vm" && -n "$selector" ]] || die "inspectにはVM名とGPU指定が必要です。"
+
+    bdf=$(resolve_gpu "$selector")
+    load_instances
+    load_vm "$vm"
+    check_cluster_location "$vm"
+    existing_line=$(check_other_assignments "$vm" "$bdf")
+    original_status=$VM_STATUS
+
+    printf '=== incus-gpu inspect %s ===\n' "$VERSION"
+    printf 'VM=%s project=%s original_status=%s\n' "$vm" "${PROJECT:-default}" "$original_status"
+    printf 'GPU=%s timeout=%ss\n' "$bdf" "$timeout"
+    [[ -n "$existing_line" ]] && printf 'Existing assignment: %s\n' "$existing_line"
+
+    preflight_gpu "$bdf"
+    printf '\n--- baseline ---\n'
+    print_vfio_state "$bdf"
+    print_pci_diagnostics "$bdf"
+
+    # inspectは一発で精査するため、稼働中VMは自動停止し、精査後に元へ戻す。
+    STOP_MODE="restart"
+    stop_vm_for_change "$vm"
+
+    printf '\n--- guarded VFIO probe ---\n'
+    if prebind_vfio_functions "$bdf" "$timeout"; then
+        bind_ok=1
+        ok "GPU関連機能のvfio-pciバインド試験に成功しました。"
+        if restore_prebound_vfio; then
+            ok "PCI状態を精査前へ復元しました。"
+        else
+            rc=$?
+            restore_ok=0
+        fi
+    else
+        rc=$?
+    fi
+
+    if [[ -n "$SYSFS_WRITE_STUCK_PID" ]]; then
+        printf '\n=== inspection summary ===\n'
+        printf 'result=KERNEL_WAIT\n'
+        printf 'vm=%s original_status=%s final_status=Stopped\n' "$vm" "$original_status"
+        printf 'gpu=%s\n' "$bdf"
+        printf 'blocked_operation=%s\n' "$SYSFS_WRITE_STUCK_LABEL"
+        printf 'worker_pid=%s state=%s wchan=%s\n' \
+            "$SYSFS_WRITE_STUCK_PID" "$SYSFS_WRITE_STUCK_STATE" "$SYSFS_WRITE_STUCK_WCHAN"
+        printf 'action=host-reboot-required-if-state-D\n'
+        return 124
+    fi
+
+    if (( VM_ORIGINALLY_RUNNING )); then
+        info "精査完了後、VM '$vm' を元の稼働状態へ戻します。"
+        if incus_mutate start "$vm"; then
+            :
+        else
+            vm_restore_ok=0
+            (( rc == 0 )) && rc=1
+            warn "VM '$vm' を再起動できませんでした。"
+        fi
+    fi
+
+    if (( ! DRY_RUN )); then
+        load_instances
+        load_vm "$vm"
+        final_status=$VM_STATUS
+    else
+        final_status="dry-run"
+    fi
+
+    printf '\n--- final host state ---\n'
+    print_vfio_state "$bdf"
+    printf '\n=== inspection summary ===\n'
+    if (( bind_ok && restore_ok && vm_restore_ok && rc == 0 )); then
+        printf 'result=PASS\n'
+    else
+        printf 'result=FAIL\n'
+    fi
+    printf 'vm=%s original_status=%s final_status=%s\n' "$vm" "$original_status" "$final_status"
+    printf 'gpu=%s bind_ok=%s restore_ok=%s vm_restore_ok=%s exit=%s\n' \
+        "$bdf" "$bind_ok" "$restore_ok" "$vm_restore_ok" "$rc"
+
+    return "$rc"
 }
 
 cmd_release_vfio() {
@@ -1696,6 +1877,7 @@ main() {
     case "$command" in
         list|ls) cmd_list "$@" ;;
         doctor|check) cmd_doctor "$@" ;;
+        inspect|probe|diagnose) cmd_inspect "$@" ;;
         attach|add) cmd_attach "$@" ;;
         detach|remove|rm) cmd_detach "$@" ;;
         status|show) cmd_status "$@" ;;

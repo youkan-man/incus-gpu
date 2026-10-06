@@ -6,6 +6,7 @@ on:
     paths:
       - '.github/workflows/apply-v0.1.6.yml'
       - '.github/scripts/apply-v0.1.6.py'
+      - '.github/scripts/fix-v0.1.6-test.py'
 
 permissions:
   contents: write
@@ -18,7 +19,9 @@ jobs:
         with:
           fetch-depth: 0
       - name: Apply changes
-        run: python3 .github/scripts/apply-v0.1.6.py
+        run: |
+          python3 .github/scripts/apply-v0.1.6.py
+          python3 .github/scripts/fix-v0.1.6-test.py
       - name: Test
         run: |
           git diff --check

@@ -10,6 +10,6 @@ if [[ $EUID -ne 0 && -z "$DESTDIR" ]]; then
     exit 1
 fi
 
-rm -f "$TARGET"
+rm -f "$TARGET" "$DESTDIR$PREFIX/libexec/incus-gpu/runtime.py"
 echo "Removed: $TARGET"
-echo "prepare-hostで作成した起動設定も消す場合: sudo incus-gpu prepare-host --undo"
+echo "管理したGRUB設定は保持します。解除はアンインストール前に prepare-host --undo を実行してください。"

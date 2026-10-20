@@ -158,7 +158,7 @@ done
 set -- "${args[@]}"
 
 update_status() {
-    python3 - "$STATE" "$1" "$2" <<'PY'
+    python3 -S - "$STATE" "$1" "$2" <<'PY'
 import json, pathlib, sys
 path = pathlib.Path(sys.argv[1])
 name, status = sys.argv[2], sys.argv[3]
@@ -179,7 +179,7 @@ case "${1:-}" in
         echo 'Server version: 7.0.1'
         ;;
     query)
-        python3 - <<'PY_QUERY'
+        python3 -S - <<'PY_QUERY'
 import json, os
 print(json.dumps({"environment": {
     "server_clustered": os.environ.get("MOCK_CLUSTERED", "false").lower() == "true",
@@ -209,7 +209,7 @@ PY_QUERY
             add)
                 type=$6
                 shift 6
-                python3 - "$STATE" "$vm" "$dev" "$type" "$@" <<'PY'
+                python3 -S - "$STATE" "$vm" "$dev" "$type" "$@" <<'PY'
 import json, pathlib, sys
 path = pathlib.Path(sys.argv[1])
 vm, name, typ = sys.argv[2:5]
@@ -232,7 +232,7 @@ path.write_text(json.dumps(data, indent=2))
 PY
                 ;;
             remove)
-                python3 - "$STATE" "$vm" "$dev" <<'PY'
+                python3 -S - "$STATE" "$vm" "$dev" <<'PY'
 import json, pathlib, sys
 path = pathlib.Path(sys.argv[1])
 vm, name = sys.argv[2:4]
@@ -290,7 +290,7 @@ assert_contains() {
 
 state_has_device() {
     local vm=$1 dev=$2 expected_pci=${3:-}
-    python3 - "$STATE" "$vm" "$dev" "$expected_pci" <<'PY'
+    python3 -S - "$STATE" "$vm" "$dev" "$expected_pci" <<'PY'
 import json, sys
 state, vm, dev, expected = sys.argv[1:5]
 data = json.load(open(state))
@@ -312,7 +312,7 @@ state_lacks_device() {
 
 state_is() {
     local vm=$1 expected=$2
-    python3 - "$STATE" "$vm" "$expected" <<'PY'
+    python3 -S - "$STATE" "$vm" "$expected" <<'PY'
 import json, sys
 data = json.load(open(sys.argv[1]))
 for inst in data:
@@ -335,9 +335,9 @@ test_attach_stopped() {
 
 test_attach_idempotent() {
     local before after
-    before=$(python3 -c 'import json,sys; print(len(next(x for x in json.load(open(sys.argv[1])) if x["name"]=="vm-stopped")["devices"]))' "$STATE")
+    before=$(python3 -S -c 'import json,sys; print(len(next(x for x in json.load(open(sys.argv[1])) if x["name"]=="vm-stopped")["devices"]))' "$STATE")
     $TOOL attach vm-stopped 01:00.0 >/dev/null
-    after=$(python3 -c 'import json,sys; print(len(next(x for x in json.load(open(sys.argv[1])) if x["name"]=="vm-stopped")["devices"]))' "$STATE")
+    after=$(python3 -S -c 'import json,sys; print(len(next(x for x in json.load(open(sys.argv[1])) if x["name"]=="vm-stopped")["devices"]))' "$STATE")
     [[ "$before" == "$after" ]]
 }
 
@@ -438,51 +438,41 @@ test_bind_write_watchdog_returns() {
             "$rc" "$elapsed" "$out" >&2
         return 1
     fi
-    if ! assert_contains "$out" '監視ワーカーPID='; then
+    if ! assert_contains "$out" 'timeout pid='; then
         printf 'watchdog PID output missing: rc=%s elapsed=%s\n%s\n' \
             "$rc" "$elapsed" "$out" >&2
         return 1
     fi
-    if [[ "$out" != *"タイムアウトで中断しました"* && \
-          "$out" != *"sysfsワーカーがカーネル待ち"* ]]; then
+    if [[ "$out" != *"操作の完了状態が不明"* ]]; then
         printf 'watchdog timeout output missing: rc=%s elapsed=%s\n%s\n' \
             "$rc" "$elapsed" "$out" >&2
         return 1
     fi
 }
 
-test_driver_override_write_watchdog_returns() {
-    local out
-    out=$($TOOL bind-vfio 0000:03:00.0 --force --timeout 7 --dry-run 2>&1)
-    assert_contains "$out" 'driver_override設定 (0000:03:00.0)' && \
-        assert_contains "$out" '(watchdog=7s)'
+test_snapshot_read_timeout_before_stop() {
+    local path="$SYS/bus/pci/devices/0000:03:00.0/driver_override" out_file="$TMP/snapshot-read.out" rc
+    local before after
+    rm -f "$path"; mkfifo "$path"
+    before=$(wc -l < "$LOG")
+    if INCUS_GPU_IO_TIMEOUT=0.3 timeout 10 "$TOOL" attach vm-running 0000:03:00.0 \
+        --project app-deploy --prebind-vfio --restart --force >"$out_file" 2>&1; then rc=0; else rc=$?; fi
+    rm -f "$path"; printf '(null)\n' > "$path"
+    after=$(tail -n +"$((before+1))" "$LOG")
+    (( rc != 0 && rc != 124 )) && state_is vm-running Running && \
+        [[ "$after" != *"stop vm-running"* && "$after" != *"config device add"* ]] && \
+        grep -q 'VM停止前に中止' "$out_file"
 }
-test_inspect_single_command_restores_vm() {
-    local bind_path="$SYS/bus/pci/drivers/vfio-pci/bind"
-    local out_file="$TMP/inspect-watchdog.out" out rc elapsed start
 
-    rm -f "$SYS/bus/pci/devices/0000:03:00.0/driver"
-    printf '(null)\n' > "$SYS/bus/pci/devices/0000:03:00.0/driver_override"
-    rm -f "$bind_path"
-    mkfifo "$bind_path"
-
-    start=$SECONDS
-    if timeout 10 "$TOOL" inspect vm-running 0000:03:00.0 \
-        --project app-deploy --timeout 1 --force >"$out_file" 2>&1; then
-        rc=0
-    else
-        rc=$?
-    fi
-    elapsed=$((SECONDS - start))
-    rm -f "$bind_path"
-    : > "$bind_path"
-    out=$(cat "$out_file")
-
-    (( rc != 0 && elapsed < 8 )) && \
-        state_is vm-running Running && \
-        assert_contains "$out" '=== inspection summary ===' && \
-        assert_contains "$out" 'result=FAIL' && \
-        assert_contains "$out" 'final_status=Running'
+test_inspect_is_read_only() {
+    local before out
+    before=$(wc -l < "$LOG")
+    out=$("$TOOL" inspect vm-running 0000:03:00.0 --project app-deploy --timeout 1 2>&1) || {
+        printf '%s\n' "$out" >&2; return 1;
+    }
+    state_is vm-running Running && assert_contains "$out" 'result=COLLECTED' && \
+        assert_contains "$out" 'report=' && \
+        ! tail -n +"$((before+1))" "$LOG" | grep -Eq '(^| )(stop|start|config)( |$)'
 }
 
 test_prepare_dry_run() {
@@ -543,9 +533,9 @@ run_test 'prepare-host dry-run changes nothing' test_prepare_dry_run
 run_test 'doctor validates fixture' test_doctor
 run_test 'start failure rolls back GPU and restores VM' test_start_failure_rolls_back
 run_test 'cluster member mismatch is blocked' test_cluster_member_mismatch
-run_test 'blocking driver_override returns via watchdog' test_driver_override_write_watchdog_returns
+run_test 'blocked snapshot read aborts before stopping VM' test_snapshot_read_timeout_before_stop
 run_test 'blocking sysfs bind returns via watchdog' test_bind_write_watchdog_returns
-run_test 'inspect is one command and restores VM' test_inspect_single_command_restores_vm
+run_test 'inspect is one read-only command' test_inspect_is_read_only
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 ((fail == 0))

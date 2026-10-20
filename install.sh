@@ -16,6 +16,11 @@ if [[ $EUID -ne 0 && -z "$DESTDIR" ]]; then
     exit 1
 fi
 
+RUNTIME_TARGET="$DESTDIR$PREFIX/libexec/incus-gpu/runtime.py"
+[[ -f "$ROOT_DIR/lib/incus_gpu_runtime.py" ]] || { echo "runtime source missing" >&2; exit 1; }
+python3 -m py_compile "$ROOT_DIR/lib/incus_gpu_runtime.py"
+# Install helper first; the CLI must never refer to an absent new runtime.
+install -D -m 0644 "$ROOT_DIR/lib/incus_gpu_runtime.py" "$RUNTIME_TARGET"
 install -D -m 0755 "$ROOT_DIR/incus-gpu" "$TARGET"
 echo "Installed: $TARGET"
 echo "Run: incus-gpu --help"

@@ -1,0 +1,27 @@
+name: Validate incus-gpu
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax and regression tests
+        run: |
+          bash -n incus-gpu install.sh uninstall.sh tests/test.sh
+          bash tests/test.sh
+          if test -f tests/test_runtime.py; then python3 -m unittest discover -s tests -p 'test_*.py' -v; fi
+      - name: Package tested sources
+        if: always()
+        run: git archive --format=tar HEAD > incus-gpu-source.tar
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tested-source
+          path: incus-gpu-source.tar
+          retention-days: 3

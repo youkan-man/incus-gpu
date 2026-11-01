@@ -296,8 +296,12 @@ if restore_prebound_vfio; then exit 99; fi
         state.mkdir(mode=0o700)
         env['INCUS_GPU_STATE_DIR'] = str(state)
         pending = state / 'uncertain.json'
-        pending.write_text(json.dumps({'reason': {'pid': 99999999, 'starttime': 'old',
-                                                'command': ['python3', '_worker', 'write']}}))
+        pending.write_text(json.dumps({'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                                      'reason': {'pid': 99999999, 'starttime': 'old',
+                                                 'target': {'vm': 'test-vm', 'project': 'default',
+                                                            'gpu': '0000:0a:00.0',
+                                                            'sysfs_root': env['INCUS_GPU_SYSFS_ROOT']},
+                                                 'command': ['python3', '_worker', 'write']}}))
         r = subprocess.run(['bash', str(TOOL), 'inspect', 'test-vm', '0000:0a:00.0'], env=env,
                            text=True, capture_output=True, timeout=15)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)

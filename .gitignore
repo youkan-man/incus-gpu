@@ -1,2 +1,5 @@
 __pycache__/
 *.py[cod]
+
+# Stateful GPU mock evidence/build output
+gpu-mock-results/

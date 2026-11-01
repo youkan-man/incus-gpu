@@ -20,7 +20,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = "0.2.0"
+VERSION = "0.2.2"
 SELF = str(Path(__file__).resolve())
 LIMIT = 2 * 1024 * 1024
 
@@ -81,7 +81,70 @@ class Report:
             os.close(fd)
 
     def fence(self, reason):
+        reason = dict(reason)
+        target_file = self.root / "operation-target.json"
+        if target_file.exists():
+            reason["target"] = json.loads(text(target_file))
         atomic_json(self.root / "unsafe.json", reason)
+
+
+
+def proc_birth(path):
+    try:
+        return text(path / "stat", 8192).rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def scan_processes(procroot, excluded):
+    """Inspect tasks, not only TGID leaders: an incusd worker can be D while
+    its main thread is S. This function runs only in a bounded worker."""
+    rows = []
+    for entry in sorted(procroot.iterdir(), key=lambda path: path.name):
+        if not entry.name.isdigit() or int(entry.name) in excluded:
+            continue
+        try:
+            cmd = text(entry / "cmdline", 8192).replace("\0", " ")
+            related = any(name in cmd for name in ("incus-gpu", "incusd", "vfio"))
+            tasks = sorted((entry / "task").iterdir(), key=lambda path: path.name)
+        except OSError:
+            continue
+        for task in tasks:
+            if not task.name.isdigit():
+                continue
+            try:
+                status = text(task / "status", 16384)
+                state = re.search(r"^State:\s+(\S+)", status, re.M).group(1)
+                if state != "D" and not (related and task.name == entry.name):
+                    continue
+                rows.append({"pid": int(entry.name), "tid": int(task.name),
+                             "state": state, "command": cmd[:2048],
+                             "starttime": proc_birth(entry),
+                             "thread_starttime": proc_birth(task),
+                             "proc_path": str(task)})
+            except (OSError, AttributeError):
+                continue
+            if len(rows) >= 96:
+                break
+        if len(rows) >= 96:
+            break
+    rows.sort(key=lambda row: (row["state"] != "D", "incus" not in row["command"]))
+    return rows
+
+
+def operation_target(vm, project, gpu):
+    return {"vm": vm, "project": project, "gpu": gpu.lower(),
+            "sysfs_root": str(Path(os.environ.get("INCUS_GPU_SYSFS_ROOT", "/sys")).absolute())}
+
+
+def same_target(recorded, observed):
+    if not isinstance(recorded, dict) or not recorded.get("gpu"):
+        return False
+    if any(recorded.get(key) != observed.get(key) for key in ("gpu", "sysfs_root")):
+        return False
+    # A standalone local bind has no VM scope; a remote request always does.
+    return not recorded.get("vm") or all(recorded.get(key) == observed.get(key)
+                                         for key in ("vm", "project"))
 
 
 def worker(mode, arguments):
@@ -100,22 +163,7 @@ def worker(mode, arguments):
                 os.close(fd)
         elif mode == "processes":
             excluded = set(map(int, arguments)) | {os.getpid()}
-            rows = []
-            for entry in Path("/proc").iterdir():
-                if not entry.name.isdigit() or int(entry.name) in excluded:
-                    continue
-                try:
-                    status = text(entry / "status", 16384)
-                    state = re.search(r"^State:\s+(\S+)", status, re.M).group(1)
-                    cmd = text(entry / "cmdline", 8192).replace("\0", " ")
-                    if state == "D" or "incus-gpu" in cmd or "vfio" in cmd:
-                        rows.append({"pid": int(entry.name), "state": state,
-                                     "command": cmd[:2048], "starttime": birth(int(entry.name))})
-                except (OSError, AttributeError):
-                    continue
-                if len(rows) >= 96:
-                    break
-            print(json.dumps(rows))
+            print(json.dumps(scan_processes(Path("/proc"), excluded)))
         else:
             raise ValueError("unknown worker")
         return 0
@@ -293,6 +341,8 @@ def supervise(script, args):
                 try:
                     old = json.loads(text(pending))
                     boot = text("/proc/sys/kernel/random/boot_id").strip()
+                    if not old.get("boot_id"):
+                        raise ValueError("missing boot identity")
                     if old.get("boot_id") == boot:
                         print("[FAIL] previous PCI/Incus mutation is uncertain; inspect report: " + old.get("report", "unknown"), file=sys.stderr)
                         return 125
@@ -317,7 +367,7 @@ def supervise(script, args):
                    "result": "UNCERTAIN" if uncertain else "TIMEOUT" if result["timed_out"] else "OK" if result["rc"] == 0 else "FAIL",
                    "report": env_run, "unsafe": uncertain}
         atomic_json(report.root / "operation-summary.json", summary)
-        print("[INFO] report=%s exit=%s" % (env_run, result["rc"]), file=sys.stderr)
+        print("[INFO] report=%s exit=%s" % (env_run, exit_code), file=sys.stderr)
         return exit_code
     finally:
         if lock is not None:
@@ -368,14 +418,16 @@ def inspect(script, arguments):
 
     processes = []
     if str(sysroot) == "/sys" and str(procroot) == "/proc":
+        kres = run("kernel log", ["journalctl", "-k", "-b", "-n", "2000", "--no-pager", "-o", "short-monotonic"])
+        if kres["rc"] != 0 or not kres["stdout"].strip() or kres["stdout"].strip() == "-- No entries --":
+            run("kernel ring buffer", ["dmesg", "--color=never"])
         res = run("existing PCI-related processes", command_worker("processes", *ancestors()))
         try:
             processes = json.loads(res["stdout"])
         except ValueError:
             pass
-        for proc in processes[:24]:
-            for field in ("status", "wchan", "syscall", "stack"):
-                read(procroot / str(proc["pid"]) / field)
+        if len(processes) >= 96:
+            notes.append("Process/task enumeration reached its 96-record limit")
     read(procroot / "version")
     read(procroot / "cmdline")
     read(procroot / "sys/kernel/tainted")
@@ -419,12 +471,13 @@ def inspect(script, arguments):
     base = [incus, "--force-local", "--project", options.project]
     run("Incus version", base + ["version"])
     vmres = run("VM state", base + ["list", options.vm, "--format=json"])
-    vmstate = "unknown"
+    vmstate, vmtype = "unknown", "unknown"
     try:
         data = json.loads(vmres["stdout"])
         if isinstance(data, dict):
             data = data["metadata"]
-        vmstate = next(item["status"] for item in data if item["name"] == options.vm)
+        vm = next(item for item in data if item["name"] == options.vm)
+        vmstate, vmtype = vm["status"], vm.get("type", "unknown")
     except (ValueError, KeyError, StopIteration, TypeError):
         notes.append("VM state could not be verified")
     run("Incus VM log", base + ["info", options.vm, "--show-log"])
@@ -438,20 +491,30 @@ def inspect(script, arguments):
         remote_idle = isinstance(ops, dict) and set(ops).issubset(allowed) and not ops.get("running") and not ops.get("pending")
     except (ValueError, TypeError):
         pass
+    task_deadline = min(deadline, time.monotonic() + 12)
+    collected_tasks = 0
+    for proc in processes[:16]:
+        if time.monotonic() >= task_deadline:
+            break
+        for field in ("status", "wchan", "syscall", "stack"):
+            if time.monotonic() >= task_deadline:
+                break
+            task = procroot / str(proc["pid"]) / "task" / str(proc.get("tid", proc["pid"]))
+            read(task / field)
+        collected_tasks += 1
+    if collected_tasks < len(processes):
+        notes.append("Task stack collection limited: %d/%d tasks" % (collected_tasks, len(processes)))
     if str(sysroot) == "/sys" and str(procroot) == "/proc":
         for field in ("board_vendor", "board_name", "bios_version", "bios_date"):
             read(sysroot / "class/dmi/id" / field)
-        # Keep whole bounded log including Call Trace, not just grep matches.
-        kres = run("kernel log", ["journalctl", "-k", "-b", "-n", "2000", "--no-pager", "-o", "short-monotonic"])
-        if kres["rc"] != 0 or not kres["stdout"].strip() or kres["stdout"].strip() == "-- No entries --":
-            run("kernel ring buffer", ["dmesg", "--color=never"])
     timeouts = [r["label"] for r in results if r.get("timed_out")]
     # Reconcile only our own uncertainty marker, not hardware or VM settings.
     # A fresh explicit operation will take a new snapshot after reconciliation.
     reconciled = False
     state = state_directory()
     pending = state / "uncertain.json"
-    if pending.exists() and not timeouts and vmstate != "unknown" and device_states and all(
+    if pending.exists() and not timeouts and vmstate != "unknown" and vmtype == "virtual-machine" and \
+            (device_states.get(bdf, {}).get("class") or "").lower().startswith("0x03") and device_states and all(
             item.get("driver_override") is not None for item in device_states.values()):
         with open(state / "operation.lock", "a+") as lock:
             try:
@@ -459,17 +522,29 @@ def inspect(script, arguments):
                 old = json.loads(text(pending))
                 reason = old.get("reason", {})
                 local_io = "_worker" in reason.get("command", [])
+                identity_known = isinstance(reason.get("pid"), int) and reason["pid"] > 0 and bool(reason.get("starttime"))
+                target_matches = same_target(reason.get("target"), operation_target(options.vm, options.project, bdf))
+                boot_matches = old.get("boot_id") == text("/proc/sys/kernel/random/boot_id").strip()
                 still_alive = alive(reason.get("pid", -1), reason.get("starttime"))
                 conflicting = any("incus-gpu" in row["command"] and alive(row["pid"], row["starttime"]) for row in processes)
-                if not still_alive and not conflicting and (local_io or remote_idle):
+                if identity_known and target_matches and boot_matches and not still_alive and not conflicting and (local_io or remote_idle):
                     pending.unlink()
                     reconciled = True
             except (OSError, ValueError):
                 pass
     findings = []
     target = device_states.get(bdf, {})
+    valid_gpu = bool(target and (target.get("class") or "").lower().startswith("0x03"))
+    valid_vm = vmtype == "virtual-machine" and vmstate != "unknown"
+    invalid_target = not valid_gpu or not valid_vm
+    if not bdf:
+        findings.append({"code": "GPU_SELECTOR_INVALID", "evidence": options.gpu})
     if bdf and not functions:
         findings.append({"code": "GPU_NOT_FOUND", "evidence": bdf})
+    if target and not valid_gpu:
+        findings.append({"code": "GPU_CLASS_UNVERIFIED", "evidence": target.get("class")})
+    if not valid_vm:
+        findings.append({"code": "VM_UNVERIFIED", "evidence": {"status": vmstate, "type": vmtype}})
     if target and target.get("driver") != "vfio-pci":
         findings.append({"code": "GPU_NOT_BOUND", "evidence": "driver=" + target["driver"]})
     if target and target.get("driver") != "vfio-pci" and any(
@@ -477,17 +552,17 @@ def inspect(script, arguments):
         findings.append({"code": "PARTIAL_BINDING", "evidence": "a sibling is bound but the target GPU is not"})
     if timeouts:
         findings.append({"code": "IO_TIMEOUT", "evidence": timeouts})
-    blocked = [row["pid"] for row in processes if row["state"] == "D"]
+    blocked = [{"pid": row["pid"], "tid": row.get("tid", row["pid"])} for row in processes if row["state"] == "D"]
     if blocked:
         findings.append({"code": "D_STATE_OBSERVED", "evidence": blocked,
                          "note": "GPU correlation must be checked in the saved stack; D alone is not a root cause"})
     kernel_text = "\n".join(r["stdout"] for r in results if r["label"] in ("kernel log", "kernel ring buffer"))
     if re.search(r"BUG:|Oops:|general protection fault|Call Trace:", kernel_text):
         findings.append({"code": "KERNEL_TRACE_PRESENT", "evidence": "see complete kernel log in report.txt"})
-    summary = {"version": VERSION, "result": "INTERRUPTED" if cancelled else "INCOMPLETE" if timeouts else "COLLECTED",
+    summary = {"version": VERSION, "result": "INTERRUPTED" if cancelled else "INCOMPLETE" if timeouts else "INVALID_TARGET" if invalid_target else "COLLECTED",
                "tool_path": script, "runtime_path": SELF, "findings": findings,
                "read_only": not options.probe, "gpu": bdf, "vm": options.vm,
-               "project": options.project, "vm_status": vmstate, "devices": device_states,
+               "project": options.project, "vm_status": vmstate, "vm_type": vmtype, "devices": device_states,
                "processes": processes, "timed_out_operations": timeouts, "notes": notes,
                "passthrough_verified": False, "previous_uncertainty_reconciled": reconciled,
                "report": str(report.root)}
@@ -505,6 +580,8 @@ def inspect(script, arguments):
         print("finding=%s evidence=%s" % (finding["code"], finding["evidence"]), flush=True)
     if cancelled:
         return 130
+    if invalid_target:
+        return 124 if timeouts else 2
     if options.probe:
         if timeouts or any(p["state"] == "D" or "incus-gpu" in p["command"] for p in processes):
             print("[FAIL] outstanding I/O or another tool process; active probe skipped", file=sys.stderr)
@@ -521,6 +598,18 @@ def inspect(script, arguments):
 def main():
     os.umask(0o077)
     mode = sys.argv[1]
+    if mode == "record-target":
+        vm, project, gpu = sys.argv[2:]
+        atomic_json(Report().root / "operation-target.json", operation_target(vm, project, gpu))
+        return 0
+    if mode == "record-snapshot":
+        gpu, values = sys.argv[2], sys.argv[3:]
+        if len(values) % 3:
+            raise ValueError("invalid snapshot triples")
+        devices = {values[i]: {"driver": values[i+1], "driver_override": values[i+2]}
+                   for i in range(0, len(values), 3)}
+        atomic_json(Report().root / "pci-snapshot.json", {"gpu": gpu, "devices": devices, "version": VERSION})
+        return 0
     if mode == "_worker":
         return worker(sys.argv[2], sys.argv[3:])
     if mode == "supervise":

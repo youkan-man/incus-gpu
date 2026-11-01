@@ -10,3 +10,10 @@ install:
 
 uninstall:
 	./uninstall.sh
+
+.PHONY: test-gpu-mock test-all
+
+test-gpu-mock:
+	bash tests/run-gpu-mock.sh
+
+test-all: test test-gpu-mock

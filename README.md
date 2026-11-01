@@ -483,3 +483,54 @@ FIFOを本当にブロックさせる読取り/書込み試験、TERM無視、�
 Linux VFIOのグループ/デバイスの区別は
 https://docs.kernel.org/driver-api/vfio.html を参照してください。
 `/dev/vfio/GROUP` が存在しても、GPU本体のバインド成功を意味しません。
+
+## 0.2.1: 再試行・復元とスレッド診断の修正
+
+0.2.0のコミット `00e4700101b3fb9188a978bd9faacb927c75cc27` を基準にした修正です。
+
+- GPUが既にVMへ設定済みでも、明示した `--start`、`--restart`、`--stop`、
+  `--prebind-vfio` を処理します。操作指定なしの再実行は従来どおり冪等です。
+  `--restart` は停止中VMも起動します。`--start` だけで稼働中VMを再起動しません。
+- 起動再試行に失敗しても既存GPU設定は削除しません。新規追加した設定の削除に
+  失敗した場合も、同じ失敗構成での起動要求を重ねません。
+- 音声・USB等を含む全スロット機能のIOMMUグループを変更前に検査します。
+  `release-vfio` は全関連グループとVFIO device cdevの使用状況を確認してから
+  最初のunbindを行います。使用中の機能は `--force` でも奪いません。
+  `fuser` のタイムアウト・実行エラーは「未使用」と区別します。
+- VM停止前のドライバーとoverrideを `pci-snapshot.json`、操作対象のGPU・VM・
+  プロジェクトを `operation-target.json` に保存します。不確定操作の照合解除は
+  同じ起動セッション・GPU・対象VM/プロジェクトについてのみ行います。
+  対象情報やboot identityが欠けたマーカーを勝手に消しません。
+- `inspect` は `/proc/PID/task/TID` からD状態のスレッドも列挙します。
+  Incusデーモンの代表スレッドがS状態でも、停止しているワーカーのPID/TID、
+  wchan、syscall、stackを採取できます。カーネルログは先に取得し、
+  多数のスレッドの採取によってログ採取時間が失われないようにします。
+- 存在しないGPUや確認不能なVMを `COLLECTED` の成功扱いにしません。
+  `INVALID_TARGET`（終了値2）または期限超過時の `INCOMPLETE` を返します。
+  `inspect --probe` でも読み取り確認に失敗した対象を変更しません。
+
+読み取り診断は従来と同じ単一コマンドです。
+
+```bash
+sudo ./incus-gpu inspect sb-436b44fcd4fe 0000:0a:00.0 --project app-deploy
+```
+
+`make test` はCLI回帰20件とPython回帰38件、計58件を実行します。
+追加試験はシェルの実際の状態遷移に対しPCI/Incus境界を模擬しており、
+GPUハードウェア、カーネルのD状態、実VM起動の成功を証明するものではありません。
+
+参照: Linuxのproc task情報 https://docs.kernel.org/filesystems/proc.html 、
+VFIOのグループとdevice cdev https://docs.kernel.org/driver-api/vfio.html 。
+
+## 0.2.2: 状態付きGPUモックでの結合検証
+
+`bash tests/run-gpu-mock.sh` で、実GPU・sudoなしに本番CLIを一時sysfs/模擬Incusに接続して検証できます。
+既存の関数差し替え試験に加え、実際のread/writeを境界でモックし、driverリンク、VFIOノード、
+VM状態を連動させます。40ケースの操作履歴と前後状態を保存します。
+詳細と実機との差は `tests/gpu_mock/README.md` を参照してください。
+
+この検証で、未バインドのGPUに `driver_override=vfio-pci` だけが残った場合、
+`release-vfio` が成功表示しながらoverrideを残す不具合を再現しました。
+VFIO選択が残る未バインド機能も解除・ホストへ再probeするよう修正しています。
+別ドライバーを指定したoverrideや、ホストドライバーで使用中の機能はこの変更では解除しません。
+モックの成功は、実GPUのパススルー成功や以前のカーネル停止の解消を示すものではありません。
